@@ -2,7 +2,7 @@ use ratatui::{
     Frame,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
 };
 
 use crate::app::{App, Screen};
@@ -130,13 +130,14 @@ fn draw_artifact_menu(
     frame.render_widget(list, area);
 }
 
-fn draw_artifact_view(frame: &mut Frame, title: &str, content: &str, scroll: usize) {
+pub fn draw_artifact_view(frame: &mut Frame, title: &str, content: &str, scroll: usize) {
     let area = frame.area();
 
     let lines: Vec<Line> = content.lines().map(Line::from).collect();
     let total_lines = lines.len();
 
     let paragraph = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
         .scroll((scroll as u16, 0))
         .block(
             Block::default()
@@ -149,4 +150,70 @@ fn draw_artifact_view(frame: &mut Frame, title: &str, content: &str, scroll: usi
                 .borders(Borders::ALL),
         );
     frame.render_widget(paragraph, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn render_artifact_view(width: u16, height: u16, content: &str, scroll: usize) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_artifact_view(frame, "test", content, scroll);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut lines = Vec::new();
+        for y in 0..height {
+            let mut line = String::new();
+            for x in 0..width {
+                line.push_str(buffer.cell((x, y)).unwrap().symbol());
+            }
+            lines.push(line.trim_end().to_string());
+        }
+        lines.join("\n")
+    }
+
+    #[test]
+    fn test_long_lines_are_wrapped() {
+        // Terminal is 20 wide; border takes 2 chars, leaving 18 content chars.
+        // A line longer than 18 chars should wrap onto the next rendered line.
+        let content = "aaa bbb ccc ddd eee fff ggg";
+        let rendered = render_artifact_view(20, 6, content, 0);
+        // The content area is lines 1..5 (between top and bottom border).
+        // With wrapping, the long line should span multiple rendered lines.
+        // With wrapping enabled, the long line should span multiple rendered lines.
+        // Verify that both early and later words appear in the render.
+        assert!(rendered.contains("aaa"), "First word should be visible");
+        assert!(rendered.contains("fff"), "Later word should be visible via wrapping");
+    }
+
+    #[test]
+    fn test_short_lines_remain_unchanged() {
+        let content = "short line";
+        let rendered = render_artifact_view(40, 5, content, 0);
+        let content_lines: Vec<&str> = rendered.lines().collect();
+        // Content line 1 (after top border) should contain the text
+        assert!(content_lines[1].contains("short line"));
+        // Content line 2 should be empty (no wrapping occurred)
+        let line2_content = content_lines[2]
+            .trim_start_matches('│')
+            .trim_end_matches('│')
+            .trim();
+        assert!(line2_content.is_empty(), "Second content line should be empty for short text");
+    }
+
+    #[test]
+    fn test_leading_whitespace_preserved() {
+        let content = "    indented text that is quite long and should wrap";
+        let rendered = render_artifact_view(30, 6, content, 0);
+        let content_lines: Vec<&str> = rendered.lines().collect();
+        // The first content line (after border) should start with the leading spaces
+        let first_content = content_lines[1]
+            .trim_start_matches('│');
+        assert!(first_content.starts_with("    "), "Leading whitespace should be preserved, got: '{}'", first_content);
+    }
 }
