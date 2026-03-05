@@ -41,9 +41,26 @@ pub struct SpecItem {
     pub path: PathBuf,
 }
 
+/// Construct a `Command` for invoking the `openspec` CLI.
+///
+/// On Windows, npm-installed tools use `.cmd` wrappers that `Command::new`
+/// cannot resolve directly. We use `cmd /C openspec` so that `cmd.exe`
+/// handles PATHEXT resolution. On Unix/macOS, invoke the binary directly.
+#[cfg(windows)]
+fn openspec_command() -> Command {
+    let mut cmd = Command::new("cmd");
+    cmd.args(["/C", "openspec"]);
+    cmd
+}
+
+#[cfg(not(windows))]
+fn openspec_command() -> Command {
+    Command::new("openspec")
+}
+
 /// Run `openspec list --json` and parse the result.
 pub fn list_changes() -> Result<ChangeListOutput, String> {
-    let output = Command::new("openspec")
+    let output = openspec_command()
         .args(["list", "--json"])
         .output()
         .map_err(|e| {
@@ -65,7 +82,7 @@ pub fn list_changes() -> Result<ChangeListOutput, String> {
 
 /// Run `openspec status --change <name> --json` and parse the result.
 pub fn get_change_status(name: &str) -> Result<ChangeStatusOutput, String> {
-    let output = Command::new("openspec")
+    let output = openspec_command()
         .args(["status", "--change", name, "--json"])
         .output()
         .map_err(|e| format!("Failed to run openspec status: {e}"))?;
@@ -188,6 +205,16 @@ mod tests {
         assert_eq!(result.artifacts[0].status, "done");
         assert_eq!(result.artifacts[3].id, "tasks");
         assert_eq!(result.artifacts[3].status, "pending");
+    }
+
+    #[test]
+    fn test_openspec_command_returns_valid_command() {
+        let cmd = openspec_command();
+        let program = format!("{:?}", cmd.get_program());
+        #[cfg(not(windows))]
+        assert_eq!(program, "\"openspec\"");
+        #[cfg(windows)]
+        assert_eq!(program, "\"cmd\"");
     }
 
     #[test]
