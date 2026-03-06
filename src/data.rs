@@ -138,6 +138,27 @@ pub fn parse_task_progress(path: &Path) -> Result<(u32, u32), String> {
     Ok((completed, total))
 }
 
+/// Find the first unchecked task in a tasks.md file.
+///
+/// Scans all `- [x]`/`- [X]` (checked) and `- [ ]` (unchecked) lines.
+/// Returns the 1-based task index and description text of the first unchecked
+/// task, or `None` if all tasks are complete or no tasks exist.
+pub fn next_unchecked_task(path: &Path) -> Option<(u32, String)> {
+    let content = fs::read_to_string(path).ok()?;
+    let mut task_index = 0u32;
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("- [x]") || trimmed.starts_with("- [X]") {
+            task_index += 1;
+        } else if trimmed.starts_with("- [ ]") {
+            task_index += 1;
+            let text = trimmed.trim_start_matches("- [ ]").trim().to_string();
+            return Some((task_index, text));
+        }
+    }
+    None
+}
+
 /// Discover spec sub-items by listing the `specs/` subdirectory of a change.
 pub fn discover_specs(change_dir: &Path) -> Vec<SpecItem> {
     let specs_dir = change_dir.join("specs");
@@ -347,5 +368,60 @@ mod tests {
         let path = std::env::temp_dir().join("openspec-tui-test-nonexistent/tasks.md");
         let result = parse_task_progress(&path);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_next_unchecked_task_mixed() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-next-mixed");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tasks.md");
+        fs::write(
+            &path,
+            "## Tasks\n\n- [x] Task one\n- [ ] Task two\n- [ ] Task three\n",
+        )
+        .unwrap();
+        let result = next_unchecked_task(&path);
+        assert_eq!(result, Some((2, "Task two".to_string())));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_next_unchecked_task_all_complete() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-next-alldone");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tasks.md");
+        fs::write(&path, "- [x] Task one\n- [x] Task two\n").unwrap();
+        let result = next_unchecked_task(&path);
+        assert_eq!(result, None);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_next_unchecked_task_no_tasks() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-next-notasks");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tasks.md");
+        fs::write(&path, "## Tasks\n\nNo tasks here.\n").unwrap();
+        let result = next_unchecked_task(&path);
+        assert_eq!(result, None);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_next_unchecked_task_missing_file() {
+        let path = std::env::temp_dir().join("openspec-tui-test-next-missing/tasks.md");
+        let result = next_unchecked_task(&path);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_next_unchecked_task_first_is_unchecked() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-next-first");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tasks.md");
+        fs::write(&path, "- [ ] First task\n- [ ] Second task\n").unwrap();
+        let result = next_unchecked_task(&path);
+        assert_eq!(result, Some((1, "First task".to_string())));
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -300,6 +300,17 @@ pub fn build_artifact_menu_items(
         });
     }
 
+    // Add implementation.log entry if the file exists
+    let log_path = change_dir.join("implementation.log");
+    if log_path.exists() {
+        items.push(ArtifactMenuItem {
+            label: "Implementation Log".to_string(),
+            available: true,
+            file_path: Some(log_path),
+            is_spec_header: false,
+        });
+    }
+
     items
 }
 
@@ -993,6 +1004,54 @@ mod tests {
         let state = app.implementation.as_ref().unwrap();
         assert_eq!(state.completed, 2);
         assert_eq!(state.total, 5);
+    }
+
+    #[test]
+    fn test_build_artifact_menu_items_with_implementation_log() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-menu-with-log");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Create the implementation.log file
+        std::fs::write(dir.join("implementation.log"), "log content").unwrap();
+
+        let status = make_status(vec![
+            ("proposal", "done"),
+            ("design", "done"),
+            ("tasks", "done"),
+            ("specs", "pending"),
+        ]);
+        let items = build_artifact_menu_items(&status, &dir);
+
+        // Should have: Proposal, Design, Tasks, Specs header, Implementation Log
+        let last = items.last().unwrap();
+        assert_eq!(last.label, "Implementation Log");
+        assert!(last.available);
+        assert_eq!(last.file_path, Some(dir.join("implementation.log")));
+        assert!(!last.is_spec_header);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_build_artifact_menu_items_without_implementation_log() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-menu-no-log");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Do NOT create implementation.log
+
+        let status = make_status(vec![
+            ("proposal", "done"),
+            ("design", "done"),
+            ("tasks", "done"),
+            ("specs", "pending"),
+        ]);
+        let items = build_artifact_menu_items(&status, &dir);
+
+        // No item should have the "Implementation Log" label
+        assert!(
+            !items.iter().any(|i| i.label == "Implementation Log"),
+            "Implementation Log should not appear when file does not exist"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

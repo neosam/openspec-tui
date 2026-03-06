@@ -377,7 +377,7 @@ mod tests {
             change_name: change_name.to_string(),
             completed,
             total,
-            log_path: PathBuf::from("/tmp/openspec-implement-test.log"),
+            log_path: PathBuf::from(format!("openspec/changes/{}/implementation.log", change_name)),
             receiver: rx,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             child_handle: Arc::new(Mutex::new(None)),
@@ -419,6 +419,10 @@ mod tests {
         let state = make_impl_state("test", 0, 5);
         let rendered = render_status_bar(80, 4, &state);
         assert!(rendered.contains("Log:"), "Log path label should be displayed");
+        assert!(
+            rendered.contains("openspec/changes/test/implementation.log"),
+            "Log path should show the change-local path"
+        );
     }
 
     #[test]
@@ -470,7 +474,7 @@ mod tests {
             implementation: Some(make_impl_state("my-change", 2, 5)),
         };
 
-        let rendered = render_draw(60, 14, &app);
+        let rendered = render_draw(80, 14, &app);
         // Status bar should be visible at the bottom
         assert!(rendered.contains("my-change"), "Status bar should show change name");
         assert!(rendered.contains("2/5"), "Status bar should show progress");
