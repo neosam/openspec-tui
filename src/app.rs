@@ -2,6 +2,7 @@ use crossterm::event::KeyCode;
 use std::path::PathBuf;
 
 use crate::data::{self, ChangeEntry, ChangeStatusOutput};
+use crate::runner::{self, stop_implementation, ImplState};
 #[cfg(test)]
 use crate::data::ArtifactStatus;
 
@@ -37,6 +38,7 @@ pub struct App {
     pub screen: Screen,
     pub screen_stack: Vec<Screen>,
     pub should_quit: bool,
+    pub implementation: Option<ImplState>,
 }
 
 impl App {
@@ -58,7 +60,39 @@ impl App {
             screen,
             screen_stack: Vec::new(),
             should_quit: false,
+            implementation: None,
         })
+    }
+
+    pub fn poll_implementation(&mut self) {
+        let should_clear = if let Some(ref mut state) = self.implementation {
+            let mut clear = false;
+            while let Ok(update) = state.receiver.try_recv() {
+                match update {
+                    runner::ImplUpdate::Progress { completed, total } => {
+                        state.completed = completed;
+                        state.total = total;
+                    }
+                    runner::ImplUpdate::Finished => {
+                        clear = true;
+                        break;
+                    }
+                }
+            }
+            clear
+        } else {
+            false
+        };
+        if should_clear {
+            self.implementation = None;
+        }
+    }
+
+    pub fn stop_running_implementation(&mut self) {
+        if let Some(ref state) = self.implementation {
+            stop_implementation(state);
+            self.implementation = None;
+        }
     }
 
     pub fn handle_change_list_input(&mut self, key: KeyCode) {
@@ -121,10 +155,10 @@ impl App {
 
     pub fn handle_artifact_menu_input(&mut self, key: KeyCode) {
         let Screen::ArtifactMenu {
+            change_name,
             items,
             selected,
             change_dir,
-            ..
         } = &mut self.screen
         else {
             return;
@@ -164,6 +198,12 @@ impl App {
                     );
                     let _ = change_dir;
                     self.screen_stack.push(old_screen);
+                }
+            }
+            KeyCode::Char('R') => {
+                if self.implementation.is_none() {
+                    let name = change_name.clone();
+                    self.implementation = Some(runner::start_implementation(&name));
                 }
             }
             KeyCode::Esc => {
@@ -297,6 +337,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            implementation: None,
         };
 
         // Pressing Esc on ChangeList shouldn't crash (no parent screen)
@@ -321,6 +362,7 @@ mod tests {
             },
             screen_stack: vec![original_screen],
             should_quit: false,
+            implementation: None,
         };
 
         app.handle_artifact_menu_input(KeyCode::Esc);
@@ -345,6 +387,7 @@ mod tests {
             },
             screen_stack: vec![menu_screen],
             should_quit: false,
+            implementation: None,
         };
 
         app.handle_artifact_view_input(KeyCode::Esc);
@@ -380,6 +423,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            implementation: None,
         };
 
         // Move down
@@ -428,6 +472,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            implementation: None,
         };
 
         // Scroll down
@@ -491,6 +536,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            implementation: None,
         };
 
         app.handle_artifact_menu_input(KeyCode::Down);
@@ -558,6 +604,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            implementation: None,
         };
 
         app.handle_artifact_menu_input(KeyCode::Enter);
@@ -581,10 +628,371 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            implementation: None,
         };
 
         app.handle_artifact_menu_input(KeyCode::Enter);
         assert!(matches!(app.screen, Screen::ArtifactMenu { .. }));
+    }
+
+    #[test]
+    fn test_r_key_starts_implementation() {
+        let mut app = App {
+            screen: Screen::ArtifactMenu {
+                change_name: "test-change".to_string(),
+                change_dir: PathBuf::from("/tmp"),
+                items: vec![],
+                selected: 0,
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: None,
+        };
+
+        assert!(app.implementation.is_none());
+        app.handle_artifact_menu_input(KeyCode::Char('R'));
+        assert!(app.implementation.is_some());
+        assert_eq!(
+            app.implementation.as_ref().unwrap().change_name,
+            "test-change"
+        );
+    }
+
+    #[test]
+    fn test_r_key_ignored_when_implementation_running() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{mpsc, Arc, Mutex};
+
+        let (_tx, rx) = mpsc::channel();
+        let existing_impl = crate::runner::ImplState {
+            change_name: "existing-change".to_string(),
+            completed: 1,
+            total: 5,
+            log_path: PathBuf::from("/tmp/existing.log"),
+            receiver: rx,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            child_handle: Arc::new(Mutex::new(None)),
+        };
+
+        let mut app = App {
+            screen: Screen::ArtifactMenu {
+                change_name: "new-change".to_string(),
+                change_dir: PathBuf::from("/tmp"),
+                items: vec![],
+                selected: 0,
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: Some(existing_impl),
+        };
+
+        app.handle_artifact_menu_input(KeyCode::Char('R'));
+        // Should still be the existing implementation, not replaced
+        assert_eq!(
+            app.implementation.as_ref().unwrap().change_name,
+            "existing-change"
+        );
+    }
+
+    #[test]
+    fn test_s_key_stops_implementation() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{mpsc, Arc, Mutex};
+
+        let (_tx, rx) = mpsc::channel();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let cancel_flag_clone = cancel_flag.clone();
+        let existing_impl = crate::runner::ImplState {
+            change_name: "test-change".to_string(),
+            completed: 1,
+            total: 5,
+            log_path: PathBuf::from("/tmp/test.log"),
+            receiver: rx,
+            cancel_flag,
+            child_handle: Arc::new(Mutex::new(None)),
+        };
+
+        let mut app = App {
+            screen: Screen::ChangeList {
+                changes: vec![],
+                selected: 0,
+                error: None,
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: Some(existing_impl),
+        };
+
+        assert!(app.implementation.is_some());
+        app.stop_running_implementation();
+        assert!(app.implementation.is_none());
+        assert!(cancel_flag_clone.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_s_key_noop_when_no_implementation() {
+        let mut app = App {
+            screen: Screen::ChangeList {
+                changes: vec![],
+                selected: 0,
+                error: None,
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: None,
+        };
+
+        // Should not panic when no implementation is running
+        app.stop_running_implementation();
+        assert!(app.implementation.is_none());
+    }
+
+    #[test]
+    fn test_s_key_works_from_artifact_view() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{mpsc, Arc, Mutex};
+
+        let (_tx, rx) = mpsc::channel();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let cancel_flag_clone = cancel_flag.clone();
+        let existing_impl = crate::runner::ImplState {
+            change_name: "test-change".to_string(),
+            completed: 2,
+            total: 5,
+            log_path: PathBuf::from("/tmp/test.log"),
+            receiver: rx,
+            cancel_flag,
+            child_handle: Arc::new(Mutex::new(None)),
+        };
+
+        let mut app = App {
+            screen: Screen::ArtifactView {
+                title: "Test".to_string(),
+                content: "content".to_string(),
+                scroll: 0,
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: Some(existing_impl),
+        };
+
+        app.stop_running_implementation();
+        assert!(app.implementation.is_none());
+        assert!(cancel_flag_clone.load(std::sync::atomic::Ordering::Relaxed));
+        // Screen should remain unchanged
+        assert!(matches!(app.screen, Screen::ArtifactView { .. }));
+    }
+
+    #[test]
+    fn test_s_key_works_from_artifact_menu() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{mpsc, Arc, Mutex};
+
+        let (_tx, rx) = mpsc::channel();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let cancel_flag_clone = cancel_flag.clone();
+        let existing_impl = crate::runner::ImplState {
+            change_name: "test-change".to_string(),
+            completed: 3,
+            total: 5,
+            log_path: PathBuf::from("/tmp/test.log"),
+            receiver: rx,
+            cancel_flag,
+            child_handle: Arc::new(Mutex::new(None)),
+        };
+
+        let mut app = App {
+            screen: Screen::ArtifactMenu {
+                change_name: "test-change".to_string(),
+                change_dir: PathBuf::from("/tmp"),
+                items: vec![],
+                selected: 0,
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: Some(existing_impl),
+        };
+
+        app.stop_running_implementation();
+        assert!(app.implementation.is_none());
+        assert!(cancel_flag_clone.load(std::sync::atomic::Ordering::Relaxed));
+        // Screen should remain unchanged
+        assert!(matches!(app.screen, Screen::ArtifactMenu { .. }));
+    }
+
+    #[test]
+    fn test_poll_implementation_updates_progress() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{mpsc, Arc, Mutex};
+
+        let (tx, rx) = mpsc::channel();
+        let impl_state = crate::runner::ImplState {
+            change_name: "test-change".to_string(),
+            completed: 0,
+            total: 5,
+            log_path: PathBuf::from("/tmp/test.log"),
+            receiver: rx,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            child_handle: Arc::new(Mutex::new(None)),
+        };
+
+        let mut app = App {
+            screen: Screen::ChangeList {
+                changes: vec![],
+                selected: 0,
+                error: None,
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: Some(impl_state),
+        };
+
+        // Send progress updates
+        tx.send(crate::runner::ImplUpdate::Progress {
+            completed: 2,
+            total: 5,
+        })
+        .unwrap();
+        tx.send(crate::runner::ImplUpdate::Progress {
+            completed: 3,
+            total: 5,
+        })
+        .unwrap();
+
+        app.poll_implementation();
+
+        // Should have consumed all messages and applied the latest progress
+        let state = app.implementation.as_ref().unwrap();
+        assert_eq!(state.completed, 3);
+        assert_eq!(state.total, 5);
+    }
+
+    #[test]
+    fn test_poll_implementation_clears_on_finished() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{mpsc, Arc, Mutex};
+
+        let (tx, rx) = mpsc::channel();
+        let impl_state = crate::runner::ImplState {
+            change_name: "test-change".to_string(),
+            completed: 3,
+            total: 5,
+            log_path: PathBuf::from("/tmp/test.log"),
+            receiver: rx,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            child_handle: Arc::new(Mutex::new(None)),
+        };
+
+        let mut app = App {
+            screen: Screen::ChangeList {
+                changes: vec![],
+                selected: 0,
+                error: None,
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: Some(impl_state),
+        };
+
+        tx.send(crate::runner::ImplUpdate::Finished).unwrap();
+
+        app.poll_implementation();
+
+        assert!(app.implementation.is_none());
+    }
+
+    #[test]
+    fn test_poll_implementation_progress_then_finished() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{mpsc, Arc, Mutex};
+
+        let (tx, rx) = mpsc::channel();
+        let impl_state = crate::runner::ImplState {
+            change_name: "test-change".to_string(),
+            completed: 0,
+            total: 5,
+            log_path: PathBuf::from("/tmp/test.log"),
+            receiver: rx,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            child_handle: Arc::new(Mutex::new(None)),
+        };
+
+        let mut app = App {
+            screen: Screen::ChangeList {
+                changes: vec![],
+                selected: 0,
+                error: None,
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: Some(impl_state),
+        };
+
+        // Send progress then finished
+        tx.send(crate::runner::ImplUpdate::Progress {
+            completed: 5,
+            total: 5,
+        })
+        .unwrap();
+        tx.send(crate::runner::ImplUpdate::Finished).unwrap();
+
+        app.poll_implementation();
+
+        // Finished should clear the implementation
+        assert!(app.implementation.is_none());
+    }
+
+    #[test]
+    fn test_poll_implementation_noop_when_none() {
+        let mut app = App {
+            screen: Screen::ChangeList {
+                changes: vec![],
+                selected: 0,
+                error: None,
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: None,
+        };
+
+        // Should not panic
+        app.poll_implementation();
+        assert!(app.implementation.is_none());
+    }
+
+    #[test]
+    fn test_poll_implementation_no_messages() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{mpsc, Arc, Mutex};
+
+        let (_tx, rx) = mpsc::channel();
+        let impl_state = crate::runner::ImplState {
+            change_name: "test-change".to_string(),
+            completed: 2,
+            total: 5,
+            log_path: PathBuf::from("/tmp/test.log"),
+            receiver: rx,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            child_handle: Arc::new(Mutex::new(None)),
+        };
+
+        let mut app = App {
+            screen: Screen::ChangeList {
+                changes: vec![],
+                selected: 0,
+                error: None,
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: Some(impl_state),
+        };
+
+        app.poll_implementation();
+
+        // Should still be running with unchanged progress
+        let state = app.implementation.as_ref().unwrap();
+        assert_eq!(state.completed, 2);
+        assert_eq!(state.total, 5);
     }
 
     #[test]
@@ -597,6 +1005,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            implementation: None,
         };
 
         // Navigation on empty list shouldn't panic

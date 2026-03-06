@@ -1,8 +1,11 @@
 mod data;
 mod app;
+mod runner;
 mod ui;
 
 use std::io;
+
+use std::time::Duration;
 
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
@@ -47,29 +50,38 @@ fn run_app(terminal: &mut ratatui::Terminal<CrosstermBackend<io::Stdout>>) -> Re
     loop {
         terminal.draw(|frame| ui::draw(frame, &app))?;
 
-        if let Event::Key(key) = event::read()? {
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
+        app.poll_implementation();
 
-            if key.code == KeyCode::Char('q') {
-                return Ok(());
-            }
+        if event::poll(Duration::from_millis(500))? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
 
-            match &app.screen {
-                Screen::ChangeList { .. } => {
-                    app.handle_change_list_input(key.code);
+                if key.code == KeyCode::Char('q') {
+                    return Ok(());
                 }
-                Screen::ArtifactMenu { .. } => {
-                    app.handle_artifact_menu_input(key.code);
-                }
-                Screen::ArtifactView { .. } => {
-                    app.handle_artifact_view_input(key.code);
-                }
-            }
 
-            if app.should_quit {
-                return Ok(());
+                if key.code == KeyCode::Char('S') {
+                    app.stop_running_implementation();
+                    continue;
+                }
+
+                match &app.screen {
+                    Screen::ChangeList { .. } => {
+                        app.handle_change_list_input(key.code);
+                    }
+                    Screen::ArtifactMenu { .. } => {
+                        app.handle_artifact_menu_input(key.code);
+                    }
+                    Screen::ArtifactView { .. } => {
+                        app.handle_artifact_view_input(key.code);
+                    }
+                }
+
+                if app.should_quit {
+                    return Ok(());
+                }
             }
         }
     }

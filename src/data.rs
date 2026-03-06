@@ -58,6 +58,21 @@ fn openspec_command() -> Command {
     Command::new("openspec")
 }
 
+/// Construct a `Command` for invoking the `claude` CLI.
+///
+/// Follows the same cross-platform pattern as `openspec_command`.
+#[cfg(windows)]
+pub fn claude_command() -> Command {
+    let mut cmd = Command::new("cmd");
+    cmd.args(["/C", "claude"]);
+    cmd
+}
+
+#[cfg(not(windows))]
+pub fn claude_command() -> Command {
+    Command::new("claude")
+}
+
 /// Run `openspec list --json` and parse the result.
 pub fn list_changes() -> Result<ChangeListOutput, String> {
     let output = openspec_command()
@@ -100,6 +115,27 @@ pub fn get_change_status(name: &str) -> Result<ChangeStatusOutput, String> {
 /// Read artifact file content from disk.
 pub fn read_artifact_content(path: &Path) -> Result<String, String> {
     fs::read_to_string(path).map_err(|e| format!("Failed to read {}: {e}", path.display()))
+}
+
+/// Parse a tasks.md file and count completed vs total tasks.
+///
+/// Counts lines matching `- [x]` (completed) and `- [ ]` (uncompleted).
+/// Returns `(completed, total)`.
+pub fn parse_task_progress(path: &Path) -> Result<(u32, u32), String> {
+    let content =
+        fs::read_to_string(path).map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+    let mut completed = 0u32;
+    let mut total = 0u32;
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("- [x]") || trimmed.starts_with("- [X]") {
+            completed += 1;
+            total += 1;
+        } else if trimmed.starts_with("- [ ]") {
+            total += 1;
+        }
+    }
+    Ok((completed, total))
 }
 
 /// Discover spec sub-items by listing the `specs/` subdirectory of a change.
@@ -218,6 +254,16 @@ mod tests {
     }
 
     #[test]
+    fn test_claude_command_returns_valid_command() {
+        let cmd = claude_command();
+        let program = format!("{:?}", cmd.get_program());
+        #[cfg(not(windows))]
+        assert_eq!(program, "\"claude\"");
+        #[cfg(windows)]
+        assert_eq!(program, "\"cmd\"");
+    }
+
+    #[test]
     fn test_parse_change_list_multiple_changes() {
         let json = r#"{
             "changes": [
@@ -242,5 +288,64 @@ mod tests {
         assert_eq!(result.changes.len(), 2);
         assert_eq!(result.changes[0].name, "change-one");
         assert_eq!(result.changes[1].name, "change-two");
+    }
+
+    #[test]
+    fn test_parse_task_progress_mixed() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-mixed");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tasks.md");
+        fs::write(
+            &path,
+            "## Tasks\n\n- [x] Task one\n- [ ] Task two\n- [x] Task three\n- [ ] Task four\n",
+        )
+        .unwrap();
+        let (completed, total) = parse_task_progress(&path).unwrap();
+        assert_eq!(completed, 2);
+        assert_eq!(total, 4);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_parse_task_progress_all_done() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-alldone");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tasks.md");
+        fs::write(&path, "- [x] Task one\n- [x] Task two\n- [x] Task three\n").unwrap();
+        let (completed, total) = parse_task_progress(&path).unwrap();
+        assert_eq!(completed, 3);
+        assert_eq!(total, 3);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_parse_task_progress_none_done() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-nonedone");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tasks.md");
+        fs::write(&path, "- [ ] Task one\n- [ ] Task two\n").unwrap();
+        let (completed, total) = parse_task_progress(&path).unwrap();
+        assert_eq!(completed, 0);
+        assert_eq!(total, 2);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_parse_task_progress_no_tasks() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-notasks");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tasks.md");
+        fs::write(&path, "## Tasks\n\nNo tasks here.\n").unwrap();
+        let (completed, total) = parse_task_progress(&path).unwrap();
+        assert_eq!(completed, 0);
+        assert_eq!(total, 0);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_parse_task_progress_file_not_found() {
+        let path = std::env::temp_dir().join("openspec-tui-test-nonexistent/tasks.md");
+        let result = parse_task_progress(&path);
+        assert!(result.is_err());
     }
 }
