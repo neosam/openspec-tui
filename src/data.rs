@@ -112,6 +112,115 @@ pub fn get_change_status(name: &str) -> Result<ChangeStatusOutput, String> {
         .map_err(|e| format!("Failed to parse openspec status output: {e}"))
 }
 
+/// List archived changes by reading `openspec/changes/archive/` directory entries.
+///
+/// Each subdirectory becomes a `ChangeEntry` with task progress parsed from its `tasks.md`.
+/// Results are sorted by date descending (newest first), then name ascending.
+/// Returns an empty list if the archive directory doesn't exist.
+pub fn list_archived_changes() -> Result<Vec<ChangeEntry>, String> {
+    let cwd = std::env::current_dir().map_err(|e| format!("Failed to get cwd: {e}"))?;
+    let archive_dir = cwd.join("openspec").join("changes").join("archive");
+
+    if !archive_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let entries = fs::read_dir(&archive_dir)
+        .map_err(|e| format!("Failed to read archive directory: {e}"))?;
+
+    let mut changes: Vec<ChangeEntry> = entries
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            if !path.is_dir() {
+                return None;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            let tasks_path = path.join("tasks.md");
+            let (completed_tasks, total_tasks) = if tasks_path.exists() {
+                parse_task_progress(&tasks_path).unwrap_or((0, 0))
+            } else {
+                (0, 0)
+            };
+            Some(ChangeEntry {
+                name,
+                completed_tasks,
+                total_tasks,
+                status: "archived".to_string(),
+            })
+        })
+        .collect();
+
+    // Sort: date descending (newest first), then name ascending within same date
+    changes.sort_by(|a, b| {
+        let date_a = if a.name.len() >= 10 { &a.name[..10] } else { &a.name };
+        let date_b = if b.name.len() >= 10 { &b.name[..10] } else { &b.name };
+        // Primary: date descending
+        let date_cmp = date_b.cmp(date_a);
+        if date_cmp != std::cmp::Ordering::Equal {
+            return date_cmp;
+        }
+        // Secondary: name remainder ascending
+        let rest_a = if a.name.len() > 11 { &a.name[11..] } else { "" };
+        let rest_b = if b.name.len() > 11 { &b.name[11..] } else { "" };
+        rest_a.cmp(rest_b)
+    });
+
+    Ok(changes)
+}
+
+/// Build a `ChangeStatusOutput` for an archived change by checking file existence.
+///
+/// Instead of calling `openspec status`, checks which artifact files exist in the
+/// archive directory. All existing files are treated as "done".
+pub fn get_archived_change_status(change_dir: &Path) -> ChangeStatusOutput {
+    let change_name = change_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    let artifact_checks = [
+        ("proposal", "proposal.md"),
+        ("design", "design.md"),
+        ("tasks", "tasks.md"),
+    ];
+
+    let mut artifacts: Vec<ArtifactStatus> = artifact_checks
+        .iter()
+        .map(|(id, filename)| {
+            let status = if change_dir.join(filename).exists() {
+                "done"
+            } else {
+                "pending"
+            };
+            ArtifactStatus {
+                id: id.to_string(),
+                output_path: filename.to_string(),
+                status: status.to_string(),
+            }
+        })
+        .collect();
+
+    // Check specs directory
+    let specs_dir = change_dir.join("specs");
+    let specs_status = if specs_dir.exists() && specs_dir.is_dir() {
+        "done"
+    } else {
+        "pending"
+    };
+    artifacts.push(ArtifactStatus {
+        id: "specs".to_string(),
+        output_path: "specs/**/*.md".to_string(),
+        status: specs_status.to_string(),
+    });
+
+    ChangeStatusOutput {
+        change_name,
+        schema_name: "spec-driven".to_string(),
+        artifacts,
+    }
+}
+
 /// Read artifact file content from disk.
 pub fn read_artifact_content(path: &Path) -> Result<String, String> {
     fs::read_to_string(path).map_err(|e| format!("Failed to read {}: {e}", path.display()))
@@ -422,6 +531,174 @@ mod tests {
         fs::write(&path, "- [ ] First task\n- [ ] Second task\n").unwrap();
         let result = next_unchecked_task(&path);
         assert_eq!(result, Some((1, "First task".to_string())));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // --- list_archived_changes tests ---
+
+    /// Helper: create a temp archive directory structure, run a closure, then clean up.
+    fn with_archived_changes<F>(test_name: &str, dirs: &[(&str, Option<&str>)], f: F)
+    where
+        F: FnOnce(&Path),
+    {
+        let base = std::env::temp_dir().join(format!("openspec-tui-test-{}", test_name));
+        let _ = fs::remove_dir_all(&base);
+        let archive_dir = base.join("openspec").join("changes").join("archive");
+        fs::create_dir_all(&archive_dir).unwrap();
+
+        for (name, tasks_content) in dirs {
+            let change_dir = archive_dir.join(name);
+            fs::create_dir_all(&change_dir).unwrap();
+            if let Some(content) = tasks_content {
+                fs::write(change_dir.join("tasks.md"), content).unwrap();
+            }
+        }
+
+        // Change to the temp base dir so list_archived_changes() finds the archive
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&base).unwrap();
+        f(&base);
+        std::env::set_current_dir(&original_dir).unwrap();
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn test_list_archived_changes_with_changes() {
+        with_archived_changes(
+            "list-with-changes",
+            &[
+                ("2026-03-06-foo", Some("- [x] Task\n- [ ] Task\n")),
+                ("2026-03-03-bar", Some("- [x] A\n- [x] B\n- [x] C\n")),
+            ],
+            |_| {
+                let result = list_archived_changes().unwrap();
+                assert_eq!(result.len(), 2);
+                // Newest first
+                assert_eq!(result[0].name, "2026-03-06-foo");
+                assert_eq!(result[0].completed_tasks, 1);
+                assert_eq!(result[0].total_tasks, 2);
+                assert_eq!(result[1].name, "2026-03-03-bar");
+                assert_eq!(result[1].completed_tasks, 3);
+                assert_eq!(result[1].total_tasks, 3);
+            },
+        );
+    }
+
+    #[test]
+    fn test_list_archived_changes_empty_directory() {
+        with_archived_changes("list-empty-dir", &[], |_| {
+            let result = list_archived_changes().unwrap();
+            assert!(result.is_empty());
+        });
+    }
+
+    #[test]
+    fn test_list_archived_changes_nonexistent_directory() {
+        let base = std::env::temp_dir().join("openspec-tui-test-list-nonexistent");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        // No openspec/changes/archive/ directory
+
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&base).unwrap();
+        let result = list_archived_changes().unwrap();
+        assert!(result.is_empty());
+        std::env::set_current_dir(&original_dir).unwrap();
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn test_list_archived_changes_sort_order() {
+        with_archived_changes(
+            "list-sort-order",
+            &[
+                ("2026-03-03-tui-change-viewer", Some("- [x] A\n")),
+                ("2026-03-06-foo", Some("- [x] A\n")),
+                ("2026-03-03-add-nix-flake", Some("- [x] A\n")),
+                ("2026-03-05-bar", Some("- [x] A\n")),
+            ],
+            |_| {
+                let result = list_archived_changes().unwrap();
+                assert_eq!(result.len(), 4);
+                // Newest first, then alphabetical within same date
+                assert_eq!(result[0].name, "2026-03-06-foo");
+                assert_eq!(result[1].name, "2026-03-05-bar");
+                assert_eq!(result[2].name, "2026-03-03-add-nix-flake");
+                assert_eq!(result[3].name, "2026-03-03-tui-change-viewer");
+            },
+        );
+    }
+
+    #[test]
+    fn test_list_archived_changes_no_tasks_md() {
+        with_archived_changes(
+            "list-no-tasks",
+            &[("2026-03-06-no-tasks", None)],
+            |_| {
+                let result = list_archived_changes().unwrap();
+                assert_eq!(result.len(), 1);
+                assert_eq!(result[0].completed_tasks, 0);
+                assert_eq!(result[0].total_tasks, 0);
+            },
+        );
+    }
+
+    // --- get_archived_change_status tests ---
+
+    #[test]
+    fn test_get_archived_change_status_all_present() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-status-all");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("proposal.md"), "proposal").unwrap();
+        fs::write(dir.join("design.md"), "design").unwrap();
+        fs::write(dir.join("tasks.md"), "tasks").unwrap();
+        let specs_dir = dir.join("specs").join("my-spec");
+        fs::create_dir_all(&specs_dir).unwrap();
+        fs::write(specs_dir.join("spec.md"), "spec").unwrap();
+
+        let status = get_archived_change_status(&dir);
+        assert_eq!(status.artifacts.len(), 4);
+        assert!(status.artifacts.iter().all(|a| a.status == "done"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_get_archived_change_status_some_missing() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-status-some");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("proposal.md"), "proposal").unwrap();
+        // No design.md
+        fs::write(dir.join("tasks.md"), "tasks").unwrap();
+        // No specs/
+
+        let status = get_archived_change_status(&dir);
+        let proposal = status.artifacts.iter().find(|a| a.id == "proposal").unwrap();
+        assert_eq!(proposal.status, "done");
+        let design = status.artifacts.iter().find(|a| a.id == "design").unwrap();
+        assert_eq!(design.status, "pending");
+        let tasks = status.artifacts.iter().find(|a| a.id == "tasks").unwrap();
+        assert_eq!(tasks.status, "done");
+        let specs = status.artifacts.iter().find(|a| a.id == "specs").unwrap();
+        assert_eq!(specs.status, "pending");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_get_archived_change_status_specs_with_subdirs() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-status-specs");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let specs_dir = dir.join("specs");
+        fs::create_dir_all(specs_dir.join("cap-a")).unwrap();
+        fs::write(specs_dir.join("cap-a").join("spec.md"), "spec a").unwrap();
+        fs::create_dir_all(specs_dir.join("cap-b")).unwrap();
+        fs::write(specs_dir.join("cap-b").join("spec.md"), "spec b").unwrap();
+
+        let status = get_archived_change_status(&dir);
+        let specs = status.artifacts.iter().find(|a| a.id == "specs").unwrap();
+        assert_eq!(specs.status, "done");
         fs::remove_dir_all(&dir).unwrap();
     }
 }

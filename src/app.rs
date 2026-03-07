@@ -6,18 +6,26 @@ use crate::runner::{self, stop_implementation, ImplState};
 #[cfg(test)]
 use crate::data::ArtifactStatus;
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChangeTab {
+    Active,
+    Archived,
+}
+
 #[derive(Debug, Clone)]
 pub enum Screen {
     ChangeList {
         changes: Vec<ChangeEntry>,
         selected: usize,
         error: Option<String>,
+        tab: ChangeTab,
     },
     ArtifactMenu {
         change_name: String,
         change_dir: PathBuf,
         items: Vec<ArtifactMenuItem>,
         selected: usize,
+        is_archived: bool,
     },
     ArtifactView {
         title: String,
@@ -48,11 +56,13 @@ impl App {
                 changes: list.changes,
                 selected: 0,
                 error: None,
+                tab: ChangeTab::Active,
             },
             Err(e) => Screen::ChangeList {
                 changes: Vec::new(),
                 selected: 0,
                 error: Some(e),
+                tab: ChangeTab::Active,
             },
         };
 
@@ -97,7 +107,10 @@ impl App {
 
     pub fn handle_change_list_input(&mut self, key: KeyCode) {
         let Screen::ChangeList {
-            changes, selected, ..
+            changes,
+            selected,
+            tab,
+            ..
         } = &mut self.screen
         else {
             return;
@@ -114,25 +127,59 @@ impl App {
                     *selected -= 1;
                 }
             }
+            KeyCode::Right | KeyCode::Char('l') => {
+                if *tab == ChangeTab::Active {
+                    *tab = ChangeTab::Archived;
+                    *selected = 0;
+                    match data::list_archived_changes() {
+                        Ok(archived) => {
+                            *changes = archived;
+                        }
+                        Err(_) => {
+                            *changes = Vec::new();
+                        }
+                    }
+                }
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                if *tab == ChangeTab::Archived {
+                    *tab = ChangeTab::Active;
+                    *selected = 0;
+                    match data::list_changes() {
+                        Ok(list) => {
+                            *changes = list.changes;
+                        }
+                        Err(_) => {
+                            *changes = Vec::new();
+                        }
+                    }
+                }
+            }
             KeyCode::Enter => {
                 if changes.is_empty() {
                     return;
                 }
                 let change = &changes[*selected];
                 let change_name = change.name.clone();
-                self.enter_artifact_menu(&change_name);
+                let is_archived = *tab == ChangeTab::Archived;
+                self.enter_artifact_menu(&change_name, is_archived);
             }
             _ => {}
         }
     }
 
-    fn enter_artifact_menu(&mut self, change_name: &str) {
-        let status = match data::get_change_status(change_name) {
-            Ok(s) => s,
-            Err(_) => return,
+    fn enter_artifact_menu(&mut self, change_name: &str, is_archived: bool) {
+        let change_dir = self.find_change_dir(change_name, is_archived);
+
+        let status = if is_archived {
+            data::get_archived_change_status(&change_dir)
+        } else {
+            match data::get_change_status(change_name) {
+                Ok(s) => s,
+                Err(_) => return,
+            }
         };
 
-        let change_dir = self.find_change_dir(change_name);
         let items = build_artifact_menu_items(&status, &change_dir);
 
         let old_screen = std::mem::replace(
@@ -142,15 +189,22 @@ impl App {
                 change_dir,
                 items,
                 selected: 0,
+                is_archived,
             },
         );
         self.screen_stack.push(old_screen);
     }
 
-    fn find_change_dir(&self, change_name: &str) -> PathBuf {
-        // Try to find the openspec change directory
+    fn find_change_dir(&self, change_name: &str, is_archived: bool) -> PathBuf {
         let cwd = std::env::current_dir().unwrap_or_default();
-        cwd.join("openspec").join("changes").join(change_name)
+        if is_archived {
+            cwd.join("openspec")
+                .join("changes")
+                .join("archive")
+                .join(change_name)
+        } else {
+            cwd.join("openspec").join("changes").join(change_name)
+        }
     }
 
     pub fn handle_artifact_menu_input(&mut self, key: KeyCode) {
@@ -159,6 +213,7 @@ impl App {
             items,
             selected,
             change_dir,
+            is_archived,
         } = &mut self.screen
         else {
             return;
@@ -201,7 +256,7 @@ impl App {
                 }
             }
             KeyCode::Char('R') => {
-                if self.implementation.is_none() {
+                if !*is_archived && self.implementation.is_none() {
                     let name = change_name.clone();
                     self.implementation = Some(runner::start_implementation(&name));
                 }
@@ -345,6 +400,7 @@ mod tests {
                 }],
                 selected: 0,
                 error: None,
+                tab: ChangeTab::Active,
             },
             screen_stack: Vec::new(),
             should_quit: false,
@@ -362,6 +418,7 @@ mod tests {
             changes: vec![],
             selected: 0,
             error: None,
+            tab: ChangeTab::Active,
         };
 
         let mut app = App {
@@ -370,6 +427,7 @@ mod tests {
                 change_dir: PathBuf::from("/tmp"),
                 items: vec![],
                 selected: 0,
+                is_archived: false,
             },
             screen_stack: vec![original_screen],
             should_quit: false,
@@ -388,6 +446,7 @@ mod tests {
             change_dir: PathBuf::from("/tmp"),
             items: vec![],
             selected: 0,
+            is_archived: false,
         };
 
         let mut app = App {
@@ -431,6 +490,7 @@ mod tests {
                 ],
                 selected: 0,
                 error: None,
+                tab: ChangeTab::Active,
             },
             screen_stack: Vec::new(),
             should_quit: false,
@@ -544,6 +604,7 @@ mod tests {
                 change_dir: PathBuf::from("/tmp"),
                 items,
                 selected: 0,
+                is_archived: false,
             },
             screen_stack: Vec::new(),
             should_quit: false,
@@ -612,6 +673,7 @@ mod tests {
                     is_spec_header: false,
                 }],
                 selected: 0,
+                is_archived: false,
             },
             screen_stack: Vec::new(),
             should_quit: false,
@@ -636,6 +698,7 @@ mod tests {
                     is_spec_header: true,
                 }],
                 selected: 0,
+                is_archived: false,
             },
             screen_stack: Vec::new(),
             should_quit: false,
@@ -654,6 +717,7 @@ mod tests {
                 change_dir: PathBuf::from("/tmp"),
                 items: vec![],
                 selected: 0,
+                is_archived: false,
             },
             screen_stack: Vec::new(),
             should_quit: false,
@@ -691,6 +755,7 @@ mod tests {
                 change_dir: PathBuf::from("/tmp"),
                 items: vec![],
                 selected: 0,
+                is_archived: false,
             },
             screen_stack: Vec::new(),
             should_quit: false,
@@ -728,6 +793,7 @@ mod tests {
                 changes: vec![],
                 selected: 0,
                 error: None,
+                tab: ChangeTab::Active,
             },
             screen_stack: Vec::new(),
             should_quit: false,
@@ -747,6 +813,7 @@ mod tests {
                 changes: vec![],
                 selected: 0,
                 error: None,
+                tab: ChangeTab::Active,
             },
             screen_stack: Vec::new(),
             should_quit: false,
@@ -818,6 +885,7 @@ mod tests {
                 change_dir: PathBuf::from("/tmp"),
                 items: vec![],
                 selected: 0,
+                is_archived: false,
             },
             screen_stack: Vec::new(),
             should_quit: false,
@@ -852,6 +920,7 @@ mod tests {
                 changes: vec![],
                 selected: 0,
                 error: None,
+                tab: ChangeTab::Active,
             },
             screen_stack: Vec::new(),
             should_quit: false,
@@ -899,6 +968,7 @@ mod tests {
                 changes: vec![],
                 selected: 0,
                 error: None,
+                tab: ChangeTab::Active,
             },
             screen_stack: Vec::new(),
             should_quit: false,
@@ -933,6 +1003,7 @@ mod tests {
                 changes: vec![],
                 selected: 0,
                 error: None,
+                tab: ChangeTab::Active,
             },
             screen_stack: Vec::new(),
             should_quit: false,
@@ -960,6 +1031,7 @@ mod tests {
                 changes: vec![],
                 selected: 0,
                 error: None,
+                tab: ChangeTab::Active,
             },
             screen_stack: Vec::new(),
             should_quit: false,
@@ -992,6 +1064,7 @@ mod tests {
                 changes: vec![],
                 selected: 0,
                 error: None,
+                tab: ChangeTab::Active,
             },
             screen_stack: Vec::new(),
             should_quit: false,
@@ -1061,6 +1134,7 @@ mod tests {
                 changes: vec![],
                 selected: 0,
                 error: None,
+                tab: ChangeTab::Active,
             },
             screen_stack: Vec::new(),
             should_quit: false,
@@ -1072,5 +1146,248 @@ mod tests {
         app.handle_change_list_input(KeyCode::Up);
         app.handle_change_list_input(KeyCode::Enter);
         assert!(matches!(app.screen, Screen::ChangeList { .. }));
+    }
+
+    #[test]
+    fn test_tab_switch_active_to_archived() {
+        let mut app = App {
+            screen: Screen::ChangeList {
+                changes: vec![ChangeEntry {
+                    name: "active-change".to_string(),
+                    completed_tasks: 0,
+                    total_tasks: 1,
+                    status: "in-progress".to_string(),
+                }],
+                selected: 0,
+                error: None,
+                tab: ChangeTab::Active,
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: None,
+        };
+
+        app.handle_change_list_input(KeyCode::Right);
+        if let Screen::ChangeList { tab, selected, .. } = &app.screen {
+            assert_eq!(*tab, ChangeTab::Archived);
+            assert_eq!(*selected, 0);
+        } else {
+            panic!("Expected ChangeList screen");
+        }
+    }
+
+    #[test]
+    fn test_tab_switch_archived_to_active() {
+        let mut app = App {
+            screen: Screen::ChangeList {
+                changes: vec![],
+                selected: 0,
+                error: None,
+                tab: ChangeTab::Archived,
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: None,
+        };
+
+        app.handle_change_list_input(KeyCode::Left);
+        if let Screen::ChangeList { tab, .. } = &app.screen {
+            assert_eq!(*tab, ChangeTab::Active);
+        } else {
+            panic!("Expected ChangeList screen");
+        }
+    }
+
+    #[test]
+    fn test_tab_switch_already_on_active_left_noop() {
+        let mut app = App {
+            screen: Screen::ChangeList {
+                changes: vec![ChangeEntry {
+                    name: "test".to_string(),
+                    completed_tasks: 0,
+                    total_tasks: 1,
+                    status: "in-progress".to_string(),
+                }],
+                selected: 0,
+                error: None,
+                tab: ChangeTab::Active,
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: None,
+        };
+
+        app.handle_change_list_input(KeyCode::Left);
+        if let Screen::ChangeList { tab, changes, .. } = &app.screen {
+            assert_eq!(*tab, ChangeTab::Active);
+            // Changes should not be reloaded (still has the original entry)
+            assert_eq!(changes.len(), 1);
+            assert_eq!(changes[0].name, "test");
+        } else {
+            panic!("Expected ChangeList screen");
+        }
+    }
+
+    #[test]
+    fn test_tab_switch_already_on_archived_right_noop() {
+        let mut app = App {
+            screen: Screen::ChangeList {
+                changes: vec![],
+                selected: 0,
+                error: None,
+                tab: ChangeTab::Archived,
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: None,
+        };
+
+        app.handle_change_list_input(KeyCode::Right);
+        if let Screen::ChangeList { tab, .. } = &app.screen {
+            assert_eq!(*tab, ChangeTab::Archived);
+        } else {
+            panic!("Expected ChangeList screen");
+        }
+    }
+
+    #[test]
+    fn test_tab_switch_with_h_l_keys() {
+        let mut app = App {
+            screen: Screen::ChangeList {
+                changes: vec![],
+                selected: 0,
+                error: None,
+                tab: ChangeTab::Active,
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: None,
+        };
+
+        // Switch to archived with 'l'
+        app.handle_change_list_input(KeyCode::Char('l'));
+        if let Screen::ChangeList { tab, .. } = &app.screen {
+            assert_eq!(*tab, ChangeTab::Archived);
+        }
+
+        // Switch back to active with 'h'
+        app.handle_change_list_input(KeyCode::Char('h'));
+        if let Screen::ChangeList { tab, .. } = &app.screen {
+            assert_eq!(*tab, ChangeTab::Active);
+        }
+    }
+
+    #[test]
+    fn test_tab_switch_resets_selection() {
+        let mut app = App {
+            screen: Screen::ChangeList {
+                changes: vec![
+                    ChangeEntry {
+                        name: "a".to_string(),
+                        completed_tasks: 0,
+                        total_tasks: 1,
+                        status: "in-progress".to_string(),
+                    },
+                    ChangeEntry {
+                        name: "b".to_string(),
+                        completed_tasks: 0,
+                        total_tasks: 1,
+                        status: "in-progress".to_string(),
+                    },
+                ],
+                selected: 1,
+                error: None,
+                tab: ChangeTab::Active,
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: None,
+        };
+
+        app.handle_change_list_input(KeyCode::Right);
+        if let Screen::ChangeList { selected, .. } = &app.screen {
+            assert_eq!(*selected, 0, "Selection should reset to 0 on tab switch");
+        }
+    }
+
+    #[test]
+    fn test_r_key_ignored_on_archived_change() {
+        let mut app = App {
+            screen: Screen::ArtifactMenu {
+                change_name: "archived-change".to_string(),
+                change_dir: PathBuf::from("/tmp"),
+                items: vec![],
+                selected: 0,
+                is_archived: true,
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: None,
+        };
+
+        app.handle_artifact_menu_input(KeyCode::Char('R'));
+        assert!(
+            app.implementation.is_none(),
+            "Implementation runner should not start for archived changes"
+        );
+    }
+
+    #[test]
+    fn test_r_key_works_on_active_change() {
+        let mut app = App {
+            screen: Screen::ArtifactMenu {
+                change_name: "active-change".to_string(),
+                change_dir: PathBuf::from("/tmp"),
+                items: vec![],
+                selected: 0,
+                is_archived: false,
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: None,
+        };
+
+        app.handle_artifact_menu_input(KeyCode::Char('R'));
+        assert!(
+            app.implementation.is_some(),
+            "Implementation runner should start for active changes"
+        );
+    }
+
+    #[test]
+    fn test_find_change_dir_active() {
+        let app = App {
+            screen: Screen::ChangeList {
+                changes: vec![],
+                selected: 0,
+                error: None,
+                tab: ChangeTab::Active,
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: None,
+        };
+
+        let dir = app.find_change_dir("my-change", false);
+        assert!(dir.ends_with("openspec/changes/my-change"));
+        assert!(!dir.to_string_lossy().contains("archive"));
+    }
+
+    #[test]
+    fn test_find_change_dir_archived() {
+        let app = App {
+            screen: Screen::ChangeList {
+                changes: vec![],
+                selected: 0,
+                error: None,
+                tab: ChangeTab::Archived,
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: None,
+        };
+
+        let dir = app.find_change_dir("2026-03-06-my-change", true);
+        assert!(dir.ends_with("openspec/changes/archive/2026-03-06-my-change"));
     }
 }

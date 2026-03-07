@@ -8,7 +8,7 @@ use ratatui::{
 
 use crate::runner::ImplState;
 
-use crate::app::{App, Screen};
+use crate::app::{App, ChangeTab, Screen};
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let (content_area, status_area) = if let Some(ref impl_state) = app.implementation {
@@ -25,7 +25,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
             changes,
             selected,
             error,
-        } => draw_change_list(frame, changes, *selected, error.as_deref(), content_area),
+            tab,
+        } => draw_change_list(frame, changes, *selected, error.as_deref(), tab, content_area),
         Screen::ArtifactMenu {
             change_name,
             items,
@@ -40,14 +41,39 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
 }
 
+fn tab_title(tab: &ChangeTab) -> Line<'static> {
+    let (active_style, archived_style) = match tab {
+        ChangeTab::Active => (
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::DarkGray),
+        ),
+        ChangeTab::Archived => (
+            Style::default().fg(Color::DarkGray),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+    };
+
+    Line::from(vec![
+        Span::raw(" OpenSpec TUI ["),
+        Span::styled("Active", active_style),
+        Span::raw(" | "),
+        Span::styled("Archived", archived_style),
+        Span::raw("] "),
+    ])
+}
+
 fn draw_change_list(
     frame: &mut Frame,
     changes: &[crate::data::ChangeEntry],
     selected: usize,
     error: Option<&str>,
+    tab: &ChangeTab,
     area: Rect,
 ) {
-
     if let Some(err) = error {
         let paragraph = Paragraph::new(err)
             .style(Style::default().fg(Color::Red))
@@ -60,12 +86,18 @@ fn draw_change_list(
         return;
     }
 
+    let title = tab_title(tab);
+
     if changes.is_empty() {
-        let paragraph = Paragraph::new("No active changes found.")
+        let empty_msg = match tab {
+            ChangeTab::Active => "No active changes found.",
+            ChangeTab::Archived => "No archived changes found.",
+        };
+        let paragraph = Paragraph::new(empty_msg)
             .style(Style::default().fg(Color::DarkGray))
             .block(
                 Block::default()
-                    .title(" OpenSpec TUI ")
+                    .title(title)
                     .borders(Borders::ALL),
             );
         frame.render_widget(paragraph, area);
@@ -96,7 +128,7 @@ fn draw_change_list(
 
     let list = List::new(items).block(
         Block::default()
-            .title(" OpenSpec TUI - Changes ")
+            .title(title)
             .borders(Borders::ALL),
     );
     frame.render_widget(list, area);
@@ -468,6 +500,7 @@ mod tests {
                 changes: vec![],
                 selected: 0,
                 error: None,
+                tab: crate::app::ChangeTab::Active,
             },
             screen_stack: Vec::new(),
             should_quit: false,
@@ -493,6 +526,7 @@ mod tests {
                 changes: vec![],
                 selected: 0,
                 error: None,
+                tab: crate::app::ChangeTab::Active,
             },
             screen_stack: Vec::new(),
             should_quit: false,
@@ -509,6 +543,86 @@ mod tests {
         assert!(
             rendered.contains("OpenSpec TUI"),
             "Main content header should be visible"
+        );
+    }
+
+    fn render_change_list(width: u16, height: u16, tab: &crate::app::ChangeTab) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_change_list(
+                    frame,
+                    &[],
+                    0,
+                    None,
+                    tab,
+                    area,
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut lines = Vec::new();
+        for y in 0..height {
+            let mut line = String::new();
+            for x in 0..width {
+                line.push_str(buffer.cell((x, y)).unwrap().symbol());
+            }
+            lines.push(line.trim_end().to_string());
+        }
+        lines.join("\n")
+    }
+
+    #[test]
+    fn test_title_rendering_active_tab() {
+        let rendered = render_change_list(50, 5, &crate::app::ChangeTab::Active);
+        assert!(
+            rendered.contains("OpenSpec TUI"),
+            "Title should contain OpenSpec TUI"
+        );
+        assert!(
+            rendered.contains("Active"),
+            "Title should contain Active tab label"
+        );
+        assert!(
+            rendered.contains("Archived"),
+            "Title should contain Archived tab label"
+        );
+    }
+
+    #[test]
+    fn test_title_rendering_archived_tab() {
+        let rendered = render_change_list(50, 5, &crate::app::ChangeTab::Archived);
+        assert!(
+            rendered.contains("OpenSpec TUI"),
+            "Title should contain OpenSpec TUI"
+        );
+        assert!(
+            rendered.contains("Active"),
+            "Title should contain Active tab label"
+        );
+        assert!(
+            rendered.contains("Archived"),
+            "Title should contain Archived tab label"
+        );
+    }
+
+    #[test]
+    fn test_empty_message_active_tab() {
+        let rendered = render_change_list(50, 5, &crate::app::ChangeTab::Active);
+        assert!(
+            rendered.contains("No active changes found"),
+            "Should show active-specific empty message"
+        );
+    }
+
+    #[test]
+    fn test_empty_message_archived_tab() {
+        let rendered = render_change_list(50, 5, &crate::app::ChangeTab::Archived);
+        assert!(
+            rendered.contains("No archived changes found"),
+            "Should show archived-specific empty message"
         );
     }
 }
