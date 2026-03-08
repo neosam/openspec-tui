@@ -20,6 +20,7 @@ pub enum ConfigField {
     Prompt,
     PostImplementationPrompt,
     InteractiveCommand,
+    RunFinishedCommand,
 }
 
 #[derive(Debug, Clone)]
@@ -50,6 +51,7 @@ pub enum Screen {
         prompt: String,
         post_implementation_prompt: String,
         interactive_command: String,
+        run_finished_command: String,
         cursor_position: usize,
         focused_field: ConfigField,
         editing: bool,
@@ -171,7 +173,29 @@ impl App {
         if let Some(success) = clear_with_success {
             self.implementation = None;
             self.advance_batch(success);
+            // Fire notification if everything is done (no new implementation started)
+            if self.implementation.is_none() {
+                self.spawn_run_finished_command();
+            }
         }
+    }
+
+    /// Spawn the configured `run_finished_command` as a fire-and-forget child process.
+    /// Does nothing if the command is empty.
+    pub fn spawn_run_finished_command(&self) {
+        if self.config.run_finished_command.is_empty() {
+            return;
+        }
+        #[cfg(not(windows))]
+        let _ = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&self.config.run_finished_command)
+            .spawn();
+        #[cfg(windows)]
+        let _ = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg(&self.config.run_finished_command)
+            .spawn();
     }
 
     pub fn stop_running_implementation(&mut self) {
@@ -660,6 +684,7 @@ impl App {
                 prompt: self.config.prompt.clone(),
                 post_implementation_prompt: self.config.post_implementation_prompt.clone(),
                 interactive_command: self.config.interactive_command.clone(),
+                run_finished_command: self.config.run_finished_command.clone(),
                 cursor_position: self.config.command.len(),
                 focused_field: ConfigField::Command,
                 editing: false,
@@ -676,6 +701,7 @@ impl App {
             prompt,
             post_implementation_prompt,
             interactive_command,
+            run_finished_command,
             cursor_position,
             focused_field,
             editing,
@@ -685,9 +711,11 @@ impl App {
         };
 
         if *editing {
-            // Edit mode (Command or InteractiveCommand field)
+            // Edit mode (Command, InteractiveCommand, or RunFinishedCommand field)
             let edit_target = if *focused_field == ConfigField::InteractiveCommand {
                 interactive_command
+            } else if *focused_field == ConfigField::RunFinishedCommand {
+                run_finished_command
             } else {
                 command
             };
@@ -736,12 +764,15 @@ impl App {
                         ConfigField::Command => ConfigField::Prompt,
                         ConfigField::Prompt => ConfigField::PostImplementationPrompt,
                         ConfigField::PostImplementationPrompt => ConfigField::InteractiveCommand,
-                        ConfigField::InteractiveCommand => ConfigField::Command,
+                        ConfigField::InteractiveCommand => ConfigField::RunFinishedCommand,
+                        ConfigField::RunFinishedCommand => ConfigField::Command,
                     };
                     if *focused_field == ConfigField::Command {
                         *cursor_position = command.len();
                     } else if *focused_field == ConfigField::InteractiveCommand {
                         *cursor_position = interactive_command.len();
+                    } else if *focused_field == ConfigField::RunFinishedCommand {
+                        *cursor_position = run_finished_command.len();
                     }
                 }
                 KeyCode::Esc => {
@@ -757,6 +788,9 @@ impl App {
                     } else if *focused_field == ConfigField::InteractiveCommand {
                         *cursor_position = interactive_command.len();
                         *editing = true;
+                    } else if *focused_field == ConfigField::RunFinishedCommand {
+                        *cursor_position = run_finished_command.len();
+                        *editing = true;
                     } else {
                         // Prompt or PostImplementationPrompt field: signal caller to open $EDITOR
                         return true;
@@ -769,6 +803,7 @@ impl App {
                         prompt: prompt.clone(),
                         post_implementation_prompt: post_implementation_prompt.clone(),
                         interactive_command: interactive_command.clone(),
+                        run_finished_command: run_finished_command.clone(),
                     };
                     let _ = new_config.save_to(&self.config_path);
                     self.config = new_config;
@@ -783,6 +818,7 @@ impl App {
                     *prompt = defaults.prompt;
                     *post_implementation_prompt = defaults.post_implementation_prompt;
                     *interactive_command = defaults.interactive_command;
+                    *run_finished_command = defaults.run_finished_command;
                     *cursor_position = command.len();
                     *focused_field = ConfigField::Command;
                 }
@@ -2802,6 +2838,12 @@ mod tests {
             assert_eq!(*focused_field, ConfigField::InteractiveCommand);
         }
 
+        // Tab -> RunFinishedCommand
+        app.handle_config_input(KeyCode::Tab);
+        if let Screen::Config { focused_field, .. } = &app.screen {
+            assert_eq!(*focused_field, ConfigField::RunFinishedCommand);
+        }
+
         // Tab -> Command (wraps around)
         app.handle_config_input(KeyCode::Tab);
         if let Screen::Config { focused_field, .. } = &app.screen {
@@ -3202,6 +3244,10 @@ mod tests {
         if let Screen::Config { focused_field, .. } = &app.screen {
             assert_eq!(*focused_field, ConfigField::InteractiveCommand);
         }
+        app.handle_config_input(KeyCode::Tab); // -> RunFinishedCommand
+        if let Screen::Config { focused_field, .. } = &app.screen {
+            assert_eq!(*focused_field, ConfigField::RunFinishedCommand);
+        }
         app.handle_config_input(KeyCode::Tab); // -> Command (wrap around)
         if let Screen::Config { focused_field, .. } = &app.screen {
             assert_eq!(*focused_field, ConfigField::Command);
@@ -3332,6 +3378,275 @@ mod tests {
         } else {
             panic!("Expected Config screen");
         }
+    }
+
+    #[test]
+    fn test_config_enter_on_run_finished_command_activates_edit() {
+        let mut app = make_config_app();
+        app.push_config_screen();
+
+        // Navigate to RunFinishedCommand
+        app.handle_config_input(KeyCode::Tab); // -> Prompt
+        app.handle_config_input(KeyCode::Tab); // -> PostImplementationPrompt
+        app.handle_config_input(KeyCode::Tab); // -> InteractiveCommand
+        app.handle_config_input(KeyCode::Tab); // -> RunFinishedCommand
+
+        let result = app.handle_config_input(KeyCode::Enter);
+        assert!(!result, "Enter on RunFinishedCommand should not signal editor");
+        if let Screen::Config { editing, focused_field, .. } = &app.screen {
+            assert!(*editing, "Should be in edit mode");
+            assert_eq!(*focused_field, ConfigField::RunFinishedCommand);
+        }
+    }
+
+    #[test]
+    fn test_config_typing_in_run_finished_command_field() {
+        let mut app = make_config_app();
+        app.push_config_screen();
+
+        // Navigate to RunFinishedCommand and enter edit mode
+        app.handle_config_input(KeyCode::Tab); // -> Prompt
+        app.handle_config_input(KeyCode::Tab); // -> PostImplementationPrompt
+        app.handle_config_input(KeyCode::Tab); // -> InteractiveCommand
+        app.handle_config_input(KeyCode::Tab); // -> RunFinishedCommand
+        app.handle_config_input(KeyCode::Enter); // edit mode
+
+        // Type a command
+        app.handle_config_input(KeyCode::Char('n'));
+        app.handle_config_input(KeyCode::Char('t'));
+        app.handle_config_input(KeyCode::Char('f'));
+        app.handle_config_input(KeyCode::Char('y'));
+
+        if let Screen::Config { run_finished_command, .. } = &app.screen {
+            assert_eq!(run_finished_command, "ntfy");
+        } else {
+            panic!("Expected Config screen");
+        }
+    }
+
+    #[test]
+    fn test_config_save_persists_run_finished_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.yaml");
+
+        let mut app = App {
+            screen: Screen::ChangeList {
+                changes: vec![],
+                selected: 0,
+                error: None,
+                tab: ChangeTab::Active,
+                change_deps: HashMap::new(),
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            launch_interactive: false,
+            implementation: None,
+            batch: None,
+            config: TuiConfig::default(),
+            config_path: config_path.clone(),
+        };
+
+        app.push_config_screen();
+
+        // Navigate to RunFinishedCommand and edit
+        app.handle_config_input(KeyCode::Tab); // -> Prompt
+        app.handle_config_input(KeyCode::Tab); // -> PostImplementationPrompt
+        app.handle_config_input(KeyCode::Tab); // -> InteractiveCommand
+        app.handle_config_input(KeyCode::Tab); // -> RunFinishedCommand
+        app.handle_config_input(KeyCode::Enter); // edit mode
+
+        app.handle_config_input(KeyCode::Char('n'));
+        app.handle_config_input(KeyCode::Char('t'));
+        app.handle_config_input(KeyCode::Char('f'));
+        app.handle_config_input(KeyCode::Char('y'));
+        app.handle_config_input(KeyCode::Esc); // exit edit mode
+
+        // Save
+        app.handle_config_input(KeyCode::Char('S'));
+
+        assert_eq!(app.config.run_finished_command, "ntfy");
+
+        // Verify persisted
+        let loaded = TuiConfig::load_from(&config_path).unwrap();
+        assert_eq!(loaded.run_finished_command, "ntfy");
+    }
+
+    #[test]
+    fn test_config_reset_defaults_restores_run_finished_command() {
+        let mut app = make_config_app();
+        app.push_config_screen();
+
+        // Navigate to RunFinishedCommand and edit it
+        app.handle_config_input(KeyCode::Tab); // -> Prompt
+        app.handle_config_input(KeyCode::Tab); // -> PostImplementationPrompt
+        app.handle_config_input(KeyCode::Tab); // -> InteractiveCommand
+        app.handle_config_input(KeyCode::Tab); // -> RunFinishedCommand
+        app.handle_config_input(KeyCode::Enter); // edit mode
+        app.handle_config_input(KeyCode::Char('x'));
+        app.handle_config_input(KeyCode::Esc); // exit edit mode
+
+        if let Screen::Config { run_finished_command, .. } = &app.screen {
+            assert_eq!(run_finished_command, "x");
+        }
+
+        // Reset to defaults
+        app.handle_config_input(KeyCode::Char('D'));
+
+        if let Screen::Config { run_finished_command, .. } = &app.screen {
+            assert_eq!(run_finished_command, "");
+        } else {
+            panic!("Expected Config screen");
+        }
+    }
+
+    #[test]
+    fn test_spawn_run_finished_command_does_nothing_when_empty() {
+        let app = App {
+            screen: Screen::ChangeList {
+                changes: vec![],
+                selected: 0,
+                error: None,
+                tab: ChangeTab::Active,
+                change_deps: HashMap::new(),
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            launch_interactive: false,
+            implementation: None,
+            batch: None,
+            config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/test.yaml"),
+        };
+        // Should not panic or error when command is empty
+        app.spawn_run_finished_command();
+    }
+
+    #[test]
+    fn test_spawn_run_finished_command_runs_when_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("finished.txt");
+        let cmd = format!("touch {}", marker.display());
+
+        let app = App {
+            screen: Screen::ChangeList {
+                changes: vec![],
+                selected: 0,
+                error: None,
+                tab: ChangeTab::Active,
+                change_deps: HashMap::new(),
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            launch_interactive: false,
+            implementation: None,
+            batch: None,
+            config: TuiConfig {
+                run_finished_command: cmd,
+                ..Default::default()
+            },
+            config_path: PathBuf::from("/tmp/test.yaml"),
+        };
+
+        app.spawn_run_finished_command();
+        // Give the child process time to execute
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(marker.exists(), "Run finished command should have created the marker file");
+    }
+
+    #[test]
+    fn test_poll_implementation_fires_hook_on_single_run_finish() {
+        use std::sync::mpsc;
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("hook_fired.txt");
+        let cmd = format!("touch {}", marker.display());
+
+        let (tx, rx) = mpsc::channel();
+        tx.send(runner::ImplUpdate::Finished { success: true }).unwrap();
+
+        let mut app = App {
+            screen: Screen::ChangeList {
+                changes: vec![],
+                selected: 0,
+                error: None,
+                tab: ChangeTab::Active,
+                change_deps: HashMap::new(),
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            launch_interactive: false,
+            implementation: Some(ImplState {
+                change_name: "test".to_string(),
+                receiver: rx,
+                log_path: PathBuf::from("/tmp/test.log"),
+                cancel_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                child_handle: std::sync::Arc::new(std::sync::Mutex::new(None)),
+                completed: 0,
+                total: 0,
+            }),
+            batch: None,
+            config: TuiConfig {
+                run_finished_command: cmd,
+                ..Default::default()
+            },
+            config_path: PathBuf::from("/tmp/test.yaml"),
+        };
+
+        app.poll_implementation();
+        assert!(app.implementation.is_none());
+
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(marker.exists(), "Hook should fire on single run finish");
+    }
+
+    #[test]
+    fn test_poll_implementation_does_not_fire_hook_mid_batch() {
+        use std::sync::mpsc;
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("hook_mid_batch.txt");
+        let cmd = format!("touch {}", marker.display());
+
+        let (tx, rx) = mpsc::channel();
+        tx.send(runner::ImplUpdate::Finished { success: true }).unwrap();
+
+        let batch = BatchImplState::new(
+            vec!["change-a".to_string(), "change-b".to_string()],
+            HashMap::new(),
+        );
+
+        let mut app = App {
+            screen: Screen::ChangeList {
+                changes: vec![],
+                selected: 0,
+                error: None,
+                tab: ChangeTab::Active,
+                change_deps: HashMap::new(),
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            launch_interactive: false,
+            implementation: Some(ImplState {
+                change_name: "change-a".to_string(),
+                receiver: rx,
+                log_path: PathBuf::from("/tmp/test.log"),
+                cancel_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                child_handle: std::sync::Arc::new(std::sync::Mutex::new(None)),
+                completed: 0,
+                total: 0,
+            }),
+            batch: Some(batch),
+            config: TuiConfig {
+                run_finished_command: cmd,
+                ..Default::default()
+            },
+            config_path: PathBuf::from("/tmp/test.yaml"),
+        };
+
+        app.poll_implementation();
+        // A new implementation should have started (batch is not done yet)
+        assert!(app.implementation.is_some(), "Batch should start next change");
+
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!marker.exists(), "Hook should NOT fire mid-batch");
     }
 
     #[test]
@@ -5173,6 +5488,7 @@ mod tests {
                 prompt: "test-prompt".to_string(),
                 post_implementation_prompt: "".to_string(),
                 interactive_command: "".to_string(),
+                run_finished_command: "".to_string(),
                 cursor_position: 5,
                 focused_field: ConfigField::Command,
                 editing: false,

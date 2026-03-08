@@ -27,6 +27,8 @@ pub struct TuiConfig {
     pub post_implementation_prompt: String,
     #[serde(default = "default_interactive_command")]
     pub interactive_command: String,
+    #[serde(default)]
+    pub run_finished_command: String,
 }
 
 fn default_command() -> String {
@@ -48,6 +50,7 @@ impl Default for TuiConfig {
             prompt: default_prompt(),
             post_implementation_prompt: String::new(),
             interactive_command: default_interactive_command(),
+            run_finished_command: String::new(),
         }
     }
 }
@@ -256,6 +259,37 @@ mod tests {
         let yaml = serde_yaml::to_string(&config).unwrap();
         let deserialized: TuiConfig = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(deserialized.interactive_command, "aider --model gpt4");
+    }
+
+    #[test]
+    fn test_default_run_finished_command_is_empty() {
+        let config = TuiConfig::default();
+        assert_eq!(config.run_finished_command, "");
+    }
+
+    #[test]
+    fn test_deserialize_with_run_finished_command() {
+        let yaml = "run_finished_command: notify-send done\n";
+        let config: TuiConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.run_finished_command, "notify-send done");
+    }
+
+    #[test]
+    fn test_deserialize_without_run_finished_command_defaults_to_empty() {
+        let yaml = "command: my-tool {prompt}\nprompt: do stuff\n";
+        let config: TuiConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.run_finished_command, "");
+    }
+
+    #[test]
+    fn test_serialize_roundtrip_with_run_finished_command() {
+        let config = TuiConfig {
+            run_finished_command: "ntfy pub topic done".to_string(),
+            ..Default::default()
+        };
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        let deserialized: TuiConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(deserialized.run_finished_command, "ntfy pub topic done");
     }
 
     mod placeholder_tests {

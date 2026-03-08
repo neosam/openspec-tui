@@ -48,10 +48,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
             prompt,
             post_implementation_prompt,
             interactive_command,
+            run_finished_command,
             cursor_position,
             focused_field,
             editing,
-        } => draw_config_screen(frame, command, prompt, post_implementation_prompt, interactive_command, *cursor_position, focused_field, *editing, content_area),
+        } => draw_config_screen(frame, command, prompt, post_implementation_prompt, interactive_command, run_finished_command, *cursor_position, focused_field, *editing, content_area),
         Screen::DependencyView {
             change_name,
             dependencies,
@@ -289,6 +290,7 @@ pub fn draw_config_screen(
     prompt: &str,
     post_implementation_prompt: &str,
     interactive_command: &str,
+    run_finished_command: &str,
     cursor_position: usize,
     focused_field: &ConfigField,
     editing: bool,
@@ -299,6 +301,7 @@ pub fn draw_config_screen(
         Constraint::Min(3),   // Prompt preview
         Constraint::Length(3), // Post-implementation prompt
         Constraint::Length(3), // Interactive command
+        Constraint::Length(3), // Run finished command
         Constraint::Length(1), // Keybinding hints
     ])
     .split(area);
@@ -427,6 +430,44 @@ pub fn draw_config_screen(
     let interactive_paragraph = Paragraph::new(interactive_text).block(interactive_block);
     frame.render_widget(interactive_paragraph, chunks[3]);
 
+    // Run finished command field
+    let run_finished_style = if *focused_field == ConfigField::RunFinishedCommand {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let run_finished_block = Block::default()
+        .title(" Run Finished Command ")
+        .borders(Borders::ALL)
+        .border_style(run_finished_style);
+
+    let run_finished_text = if editing && *focused_field == ConfigField::RunFinishedCommand {
+        let before = &run_finished_command[..cursor_position];
+        let cursor_char = run_finished_command.get(cursor_position..cursor_position + 1).unwrap_or(" ");
+        let after = if cursor_position < run_finished_command.len() {
+            &run_finished_command[cursor_position + 1..]
+        } else {
+            ""
+        };
+        Line::from(vec![
+            Span::raw(before),
+            Span::styled(
+                cursor_char,
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::White),
+            ),
+            Span::raw(after),
+        ])
+    } else if run_finished_command.is_empty() {
+        Line::from(Span::styled("(disabled)", Style::default().fg(Color::DarkGray)))
+    } else {
+        Line::from(run_finished_command)
+    };
+
+    let run_finished_paragraph = Paragraph::new(run_finished_text).block(run_finished_block);
+    frame.render_widget(run_finished_paragraph, chunks[4]);
+
     // Warning if {prompt} is missing from command
     let has_prompt_placeholder = command.contains("{prompt}");
 
@@ -454,7 +495,7 @@ pub fn draw_config_screen(
 
     let hints_line = Line::from(hints);
     let hints_paragraph = Paragraph::new(hints_line);
-    frame.render_widget(hints_paragraph, chunks[4]);
+    frame.render_widget(hints_paragraph, chunks[5]);
 }
 
 pub fn draw_dependency_view(
@@ -1324,7 +1365,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                draw_config_screen(frame, command, prompt, "", "claude", cursor_position, focused_field, editing, area);
+                draw_config_screen(frame, command, prompt, "", "claude", "", cursor_position, focused_field, editing, area);
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -1398,6 +1439,7 @@ mod tests {
                 prompt: "implement {name}".to_string(),
                 post_implementation_prompt: String::new(),
                 interactive_command: "claude".to_string(),
+                run_finished_command: String::new(),
                 cursor_position: 0,
                 focused_field: ConfigField::Command,
                 editing: false,
@@ -1423,7 +1465,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                draw_config_screen(frame, "cmd {prompt}", "prompt", "", "claude", 0, &ConfigField::Command, false, area);
+                draw_config_screen(frame, "cmd {prompt}", "prompt", "", "claude", "", 0, &ConfigField::Command, false, area);
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -1445,7 +1487,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                draw_config_screen(frame, "cmd {prompt}", "prompt", "", "claude", 0, &ConfigField::Command, true, area);
+                draw_config_screen(frame, "cmd {prompt}", "prompt", "", "claude", "", 0, &ConfigField::Command, true, area);
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -1506,7 +1548,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                draw_config_screen(frame, "cmd {prompt}", "prompt", "commit changes", "claude", 0, &ConfigField::Command, false, area);
+                draw_config_screen(frame, "cmd {prompt}", "prompt", "commit changes", "claude", "", 0, &ConfigField::Command, false, area);
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -1530,7 +1572,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                draw_config_screen(frame, "cmd {prompt}", "prompt", "", "claude", 0, &ConfigField::Command, false, area);
+                draw_config_screen(frame, "cmd {prompt}", "prompt", "", "claude", "", 0, &ConfigField::Command, false, area);
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -1553,7 +1595,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                draw_config_screen(frame, "cmd {prompt}", "prompt", "", "claude", 0, &ConfigField::PostImplementationPrompt, false, area);
+                draw_config_screen(frame, "cmd {prompt}", "prompt", "", "claude", "", 0, &ConfigField::PostImplementationPrompt, false, area);
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -1997,7 +2039,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                draw_config_screen(frame, "cmd {prompt}", "prompt", "", "aider --model gpt4", 0, &ConfigField::Command, false, area);
+                draw_config_screen(frame, "cmd {prompt}", "prompt", "", "aider --model gpt4", "", 0, &ConfigField::Command, false, area);
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
