@@ -95,15 +95,20 @@ fn run_app(terminal: &mut ratatui::Terminal<CrosstermBackend<io::Stdout>>) -> Re
                 if matches!(app.screen, Screen::Config { .. }) {
                     let open_editor = app.handle_config_input(key.code);
                     if open_editor {
-                        // Get current prompt text
-                        let current_prompt = if let Screen::Config { prompt, .. } = &app.screen {
-                            prompt.clone()
-                        } else {
-                            String::new()
-                        };
-                        // Open $EDITOR with temp file
-                        if let Ok(new_prompt) = edit_in_external_editor(terminal, &current_prompt) {
-                            app.set_config_prompt(new_prompt);
+                        if let Screen::Config { prompt, post_implementation_prompt, focused_field, .. } = &app.screen {
+                            let (content, is_post_prompt) = match focused_field {
+                                app::ConfigField::PostImplementationPrompt => {
+                                    (post_implementation_prompt.clone(), true)
+                                }
+                                _ => (prompt.clone(), false),
+                            };
+                            if let Ok(new_text) = edit_in_external_editor(terminal, &content) {
+                                if is_post_prompt {
+                                    app.set_config_post_prompt(new_text);
+                                } else {
+                                    app.set_config_prompt(new_text);
+                                }
+                            }
                         }
                     }
                     if app.should_quit {

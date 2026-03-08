@@ -45,10 +45,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Screen::Config {
             command,
             prompt,
+            post_implementation_prompt,
             cursor_position,
             focused_field,
             editing,
-        } => draw_config_screen(frame, command, prompt, *cursor_position, focused_field, *editing, content_area),
+        } => draw_config_screen(frame, command, prompt, post_implementation_prompt, *cursor_position, focused_field, *editing, content_area),
         Screen::DependencyView {
             change_name,
             dependencies,
@@ -278,6 +279,7 @@ pub fn draw_config_screen(
     frame: &mut Frame,
     command: &str,
     prompt: &str,
+    post_implementation_prompt: &str,
     cursor_position: usize,
     focused_field: &ConfigField,
     editing: bool,
@@ -286,6 +288,7 @@ pub fn draw_config_screen(
     let chunks = Layout::vertical([
         Constraint::Length(3), // Command field
         Constraint::Min(3),   // Prompt preview
+        Constraint::Length(3), // Post-implementation prompt
         Constraint::Length(1), // Keybinding hints
     ])
     .split(area);
@@ -352,6 +355,32 @@ pub fn draw_config_screen(
         .block(prompt_block);
     frame.render_widget(prompt_paragraph, chunks[1]);
 
+    // Post-implementation prompt
+    let post_prompt_style = if *focused_field == ConfigField::PostImplementationPrompt {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let post_prompt_title = if *focused_field == ConfigField::PostImplementationPrompt {
+        " Post-Implementation Prompt (Enter to edit in $EDITOR) "
+    } else {
+        " Post-Implementation Prompt "
+    };
+    let post_prompt_block = Block::default()
+        .title(post_prompt_title)
+        .borders(Borders::ALL)
+        .border_style(post_prompt_style);
+
+    let post_prompt_display = if post_implementation_prompt.is_empty() {
+        "(disabled)".to_string()
+    } else {
+        post_implementation_prompt.to_string()
+    };
+    let post_prompt_paragraph = Paragraph::new(post_prompt_display)
+        .wrap(Wrap { trim: false })
+        .block(post_prompt_block);
+    frame.render_widget(post_prompt_paragraph, chunks[2]);
+
     // Warning if {prompt} is missing from command
     let has_prompt_placeholder = command.contains("{prompt}");
 
@@ -379,7 +408,7 @@ pub fn draw_config_screen(
 
     let hints_line = Line::from(hints);
     let hints_paragraph = Paragraph::new(hints_line);
-    frame.render_widget(hints_paragraph, chunks[2]);
+    frame.render_widget(hints_paragraph, chunks[3]);
 }
 
 pub fn draw_dependency_view(
@@ -1046,6 +1075,7 @@ mod tests {
             implementation: Some(make_impl_state("my-change", 2, 5)),
             batch: None,
             config: crate::config::TuiConfig::default(),
+            config_path: std::path::PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         let rendered = render_draw(80, 14, &app);
@@ -1075,6 +1105,7 @@ mod tests {
             implementation: None,
             batch: None,
             config: crate::config::TuiConfig::default(),
+            config_path: std::path::PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         let rendered = render_draw(60, 14, &app);
@@ -1236,7 +1267,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                draw_config_screen(frame, command, prompt, cursor_position, focused_field, editing, area);
+                draw_config_screen(frame, command, prompt, "", cursor_position, focused_field, editing, area);
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -1308,6 +1339,7 @@ mod tests {
             screen: crate::app::Screen::Config {
                 command: "claude --print {prompt}".to_string(),
                 prompt: "implement {name}".to_string(),
+                post_implementation_prompt: String::new(),
                 cursor_position: 0,
                 focused_field: ConfigField::Command,
                 editing: false,
@@ -1317,6 +1349,7 @@ mod tests {
             implementation: None,
             batch: None,
             config: crate::config::TuiConfig::default(),
+            config_path: std::path::PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
         let rendered = render_draw(60, 15, &app);
         assert!(rendered.contains("Command"), "Config screen should render in draw()");
@@ -1331,7 +1364,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                draw_config_screen(frame, "cmd {prompt}", "prompt", 0, &ConfigField::Command, false, area);
+                draw_config_screen(frame, "cmd {prompt}", "prompt", "", 0, &ConfigField::Command, false, area);
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -1353,7 +1386,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                draw_config_screen(frame, "cmd {prompt}", "prompt", 0, &ConfigField::Command, true, area);
+                draw_config_screen(frame, "cmd {prompt}", "prompt", "", 0, &ConfigField::Command, true, area);
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -1405,6 +1438,76 @@ mod tests {
             100, 15, "cmd --flag", "prompt", 0, &ConfigField::Command, true,
         );
         assert!(rendered_edit.contains("missing"), "Warning should show in edit mode");
+    }
+
+    #[test]
+    fn test_config_screen_shows_post_implementation_prompt_title() {
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_config_screen(frame, "cmd {prompt}", "prompt", "commit changes", 0, &ConfigField::Command, false, area);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut lines = Vec::new();
+        for y in 0..20u16 {
+            let mut line = String::new();
+            for x in 0..80u16 {
+                line.push_str(buffer.cell((x, y)).unwrap().symbol());
+            }
+            lines.push(line.trim_end().to_string());
+        }
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("Post-Implementation"), "Post-Implementation Prompt title should be visible");
+        assert!(rendered.contains("commit changes"), "Post-implementation prompt content should be visible");
+    }
+
+    #[test]
+    fn test_config_screen_shows_disabled_when_empty_post_prompt() {
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_config_screen(frame, "cmd {prompt}", "prompt", "", 0, &ConfigField::Command, false, area);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut lines = Vec::new();
+        for y in 0..20u16 {
+            let mut line = String::new();
+            for x in 0..80u16 {
+                line.push_str(buffer.cell((x, y)).unwrap().symbol());
+            }
+            lines.push(line.trim_end().to_string());
+        }
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("(disabled)"), "Empty post-implementation prompt should show (disabled)");
+    }
+
+    #[test]
+    fn test_config_screen_post_prompt_editor_hint_when_focused() {
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_config_screen(frame, "cmd {prompt}", "prompt", "", 0, &ConfigField::PostImplementationPrompt, false, area);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut lines = Vec::new();
+        for y in 0..20u16 {
+            let mut line = String::new();
+            for x in 0..100u16 {
+                line.push_str(buffer.cell((x, y)).unwrap().symbol());
+            }
+            lines.push(line.trim_end().to_string());
+        }
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("$EDITOR"), "Editor hint should show when post-implementation prompt is focused");
     }
 
     // --- Dependency View Rendering Tests ---

@@ -13,7 +13,8 @@ use crate::data;
 /// Messages sent from the worker thread to the TUI.
 pub enum ImplUpdate {
     Progress { completed: u32, total: u32 },
-    Finished,
+    Finished { success: bool },
+    Stalled,
 }
 
 /// State for a running implementation process.
@@ -222,6 +223,9 @@ fn write_run_header(log_path: &PathBuf, change_name: &str) -> Result<(), std::io
     Ok(())
 }
 
+/// Maximum consecutive runs with no task progress before aborting.
+const STALL_THRESHOLD: u32 = 3;
+
 fn implementation_loop(
     change_name: &str,
     tasks_path: &PathBuf,
@@ -234,6 +238,16 @@ fn implementation_loop(
     // Write run header before starting the task loop
     let _ = write_run_header(log_path, change_name);
 
+    // Stall detection: track consecutive runs without progress
+    let mut stall_count: u32 = 0;
+    let mut prev_completed: u32 = data::parse_task_progress(tasks_path)
+        .unwrap_or((0, 0))
+        .0;
+
+    // Track loop exit reason
+    let mut tasks_complete = false;
+    let mut stalled = false;
+
     loop {
         // Check cancellation
         if cancel_flag.load(Ordering::Relaxed) {
@@ -243,7 +257,7 @@ fn implementation_loop(
         // Check if there are unchecked tasks remaining
         let (completed, total) = data::parse_task_progress(tasks_path).unwrap_or((0, 0));
         if completed >= total || total == 0 {
-            let _ = tx.send(ImplUpdate::Finished);
+            tasks_complete = true;
             break;
         }
 
@@ -254,17 +268,11 @@ fn implementation_loop(
             .open(log_path)
         {
             Ok(f) => f,
-            Err(_) => {
-                let _ = tx.send(ImplUpdate::Finished);
-                break;
-            }
+            Err(_) => break,
         };
         let stderr_log = match log_file.try_clone() {
             Ok(f) => f,
-            Err(_) => {
-                let _ = tx.send(ImplUpdate::Finished);
-                break;
-            }
+            Err(_) => break,
         };
 
         // Write task header before spawning claude
@@ -282,17 +290,19 @@ fn implementation_loop(
                 .stdout(Stdio::from(log_file))
                 .stderr(Stdio::from(stderr_log))
                 .spawn(),
-            None => {
-                let _ = tx.send(ImplUpdate::Finished);
-                break;
-            }
+            None => break,
         };
 
         let child = match child_result {
             Ok(c) => c,
             Err(_) => {
-                let _ = tx.send(ImplUpdate::Finished);
-                break;
+                // Spawn failure counts toward stall detection
+                stall_count += 1;
+                if stall_count >= STALL_THRESHOLD {
+                    stalled = true;
+                    break;
+                }
+                continue;
             }
         };
 
@@ -305,7 +315,7 @@ fn implementation_loop(
         // Poll for child completion using try_wait so we don't hold the
         // mutex lock. This allows the main thread to lock the mutex and
         // kill the child process for cancellation.
-        let exited_ok = loop {
+        let _exited_ok = loop {
             if cancel_flag.load(Ordering::Relaxed) {
                 break false;
             }
@@ -335,24 +345,120 @@ fn implementation_loop(
             *handle = None;
         }
 
-        // If cancelled or process failed, stop
-        if cancel_flag.load(Ordering::Relaxed) || !exited_ok {
-            let _ = tx.send(ImplUpdate::Finished);
+        // If cancelled, stop without stall detection
+        if cancel_flag.load(Ordering::Relaxed) {
             break;
         }
 
-        // Re-read progress and send update
+        // Re-read progress and check for stall (regardless of exit code)
         let (completed, total) = data::parse_task_progress(tasks_path).unwrap_or((0, 0));
+
+        if completed > prev_completed {
+            // Progress was made — reset stall counter
+            stall_count = 0;
+            prev_completed = completed;
+        } else {
+            // No progress — increment stall counter
+            stall_count += 1;
+            if stall_count >= STALL_THRESHOLD {
+                stalled = true;
+                break;
+            }
+        }
+
         if tx.send(ImplUpdate::Progress { completed, total }).is_err() {
             break;
         }
 
         // If all tasks completed, finish
         if completed >= total {
-            let _ = tx.send(ImplUpdate::Finished);
+            tasks_complete = true;
             break;
         }
     }
+
+    // Don't send anything if cancelled
+    if cancel_flag.load(Ordering::Relaxed) {
+        return;
+    }
+
+    if stalled {
+        let _ = tx.send(ImplUpdate::Stalled);
+        return;
+    }
+
+    // Run post-implementation hook if tasks completed successfully
+    let mut success = tasks_complete;
+    if tasks_complete {
+        if let Some(post_prompt) = config.render_post_prompt(change_name) {
+            if let Some((binary, args)) = config.build_command(&post_prompt) {
+                // Open log file for hook output
+                let hook_ok = match OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(log_path)
+                {
+                    Ok(log_file) => {
+                        match log_file.try_clone() {
+                            Ok(stderr_log) => {
+                                match std::process::Command::new(&binary)
+                                    .args(&args)
+                                    .stdout(Stdio::from(log_file))
+                                    .stderr(Stdio::from(stderr_log))
+                                    .spawn()
+                                {
+                                    Ok(child) => {
+                                        // Store child handle for cancellation
+                                        {
+                                            let mut handle = child_handle.lock().unwrap();
+                                            *handle = Some(child);
+                                        }
+                                        // Poll for completion
+                                        let exited_ok = loop {
+                                            if cancel_flag.load(Ordering::Relaxed) {
+                                                break false;
+                                            }
+                                            let try_result = {
+                                                let mut handle = child_handle.lock().unwrap();
+                                                if let Some(ref mut c) = *handle {
+                                                    c.try_wait()
+                                                } else {
+                                                    break false;
+                                                }
+                                            };
+                                            match try_result {
+                                                Ok(Some(status)) => break status.success(),
+                                                Ok(None) => {
+                                                    std::thread::sleep(
+                                                        std::time::Duration::from_millis(100),
+                                                    );
+                                                }
+                                                Err(_) => break false,
+                                            }
+                                        };
+                                        // Clear child handle
+                                        {
+                                            let mut handle = child_handle.lock().unwrap();
+                                            *handle = None;
+                                        }
+                                        exited_ok
+                                    }
+                                    Err(_) => false,
+                                }
+                            }
+                            Err(_) => false,
+                        }
+                    }
+                    Err(_) => false,
+                };
+                if !hook_ok {
+                    success = false;
+                }
+            }
+        }
+    }
+
+    let _ = tx.send(ImplUpdate::Finished { success });
 }
 
 #[cfg(test)]
@@ -401,16 +507,46 @@ mod tests {
                 assert_eq!(completed, 3);
                 assert_eq!(total, 5);
             }
-            ImplUpdate::Finished => panic!("Expected Progress, got Finished"),
+            ImplUpdate::Finished { .. } | ImplUpdate::Stalled => {
+                panic!("Expected Progress, got Finished/Stalled")
+            }
         }
     }
 
     #[test]
     fn test_impl_update_finished() {
         let (tx, rx) = mpsc::channel();
-        tx.send(ImplUpdate::Finished).unwrap();
+        tx.send(ImplUpdate::Finished { success: true }).unwrap();
         let msg = rx.recv().unwrap();
-        assert!(matches!(msg, ImplUpdate::Finished));
+        assert!(matches!(msg, ImplUpdate::Finished { success: true }));
+    }
+
+    #[test]
+    fn test_impl_update_stalled() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(ImplUpdate::Stalled).unwrap();
+        let msg = rx.recv().unwrap();
+        assert!(matches!(msg, ImplUpdate::Stalled));
+    }
+
+    #[test]
+    fn test_impl_update_stalled_after_progress() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(ImplUpdate::Progress {
+            completed: 1,
+            total: 5,
+        })
+        .unwrap();
+        tx.send(ImplUpdate::Stalled).unwrap();
+
+        match rx.recv().unwrap() {
+            ImplUpdate::Progress { completed, total } => {
+                assert_eq!(completed, 1);
+                assert_eq!(total, 5);
+            }
+            _ => panic!("Expected Progress"),
+        }
+        assert!(matches!(rx.recv().unwrap(), ImplUpdate::Stalled));
     }
 
     #[test]
@@ -580,27 +716,31 @@ mod tests {
             &TuiConfig::default(),
         );
 
-        // Should receive Finished since all tasks are complete
+        // Should receive Finished { success: true } since all tasks are complete
         let msg = rx.recv().unwrap();
-        assert!(matches!(msg, ImplUpdate::Finished));
+        assert!(matches!(msg, ImplUpdate::Finished { success: true }));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn test_loop_sends_finished_on_spawn_failure() {
-        // Create a tasks file with uncompleted tasks so the loop tries to spawn claude
+    fn test_loop_sends_stalled_on_repeated_spawn_failure() {
+        // Create a tasks file with uncompleted tasks so the loop tries to spawn
         let dir = std::env::temp_dir().join("openspec-tui-test-spawn-fail");
         let change_dir = dir.join("openspec/changes/test-spawn");
         std::fs::create_dir_all(&change_dir).unwrap();
         let tasks_path = change_dir.join("tasks.md");
         std::fs::write(&tasks_path, "- [ ] Task one\n").unwrap();
 
+        let config = TuiConfig {
+            command: "definitely-nonexistent-binary-xyz {prompt}".to_string(),
+            prompt: "test {name}".to_string(),
+            ..Default::default()
+        };
+
         let (tx, rx) = mpsc::channel();
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let child_handle: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
-        // Use an invalid log path to cause the log file open to fail,
-        // or the claude command to fail (claude likely not available in test env)
         let log_path = dir.join("test.log");
 
         implementation_loop(
@@ -610,12 +750,12 @@ mod tests {
             &tx,
             &cancel_flag,
             &child_handle,
-            &TuiConfig::default(),
+            &config,
         );
 
-        // Should receive Finished since claude spawn will fail in test environment
+        // Should receive Stalled after 3 consecutive spawn failures
         let msg = rx.recv().unwrap();
-        assert!(matches!(msg, ImplUpdate::Finished));
+        assert!(matches!(msg, ImplUpdate::Stalled));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -669,7 +809,7 @@ mod tests {
             total: 7,
         })
         .unwrap();
-        tx.send(ImplUpdate::Finished).unwrap();
+        tx.send(ImplUpdate::Finished { success: true }).unwrap();
 
         match rx.recv().unwrap() {
             ImplUpdate::Progress { completed, total } => {
@@ -685,7 +825,7 @@ mod tests {
             }
             _ => panic!("Expected Progress"),
         }
-        assert!(matches!(rx.recv().unwrap(), ImplUpdate::Finished));
+        assert!(matches!(rx.recv().unwrap(), ImplUpdate::Finished { success: true }));
     }
 
     #[test]
@@ -867,6 +1007,7 @@ mod tests {
         let config = TuiConfig {
             command: "nonexistent-binary-xyz {prompt}".to_string(),
             prompt: "custom prompt for {name}".to_string(),
+            ..Default::default()
         };
 
         let (tx, rx) = mpsc::channel();
@@ -883,9 +1024,9 @@ mod tests {
             &config,
         );
 
-        // Should receive Finished since the nonexistent binary will fail to spawn
+        // Should receive Stalled after 3 consecutive spawn failures
         let msg = rx.recv().unwrap();
-        assert!(matches!(msg, ImplUpdate::Finished));
+        assert!(matches!(msg, ImplUpdate::Stalled));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -896,6 +1037,7 @@ mod tests {
         let config = TuiConfig {
             command: "echo {prompt}".to_string(),
             prompt: "do something with {name} please".to_string(),
+            ..Default::default()
         };
         let rendered = config.render_prompt("my-feature");
         assert_eq!(rendered, "do something with my-feature please");
@@ -913,6 +1055,7 @@ mod tests {
         let config = TuiConfig {
             command: "".to_string(),
             prompt: "test {name}".to_string(),
+            ..Default::default()
         };
 
         let (tx, rx) = mpsc::channel();
@@ -929,9 +1072,208 @@ mod tests {
             &config,
         );
 
-        // Should receive Finished since empty command returns None from build_command
+        // Should receive Finished { success: false } since empty command means failure
         let msg = rx.recv().unwrap();
-        assert!(matches!(msg, ImplUpdate::Finished));
+        assert!(matches!(msg, ImplUpdate::Finished { success: false }));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // --- Stall detection tests ---
+
+    #[test]
+    fn test_loop_sends_stalled_after_three_no_progress_runs() {
+        // Use `true` command which exits 0 but doesn't modify tasks
+        let dir = std::env::temp_dir().join("openspec-tui-test-stall-3-runs");
+        let change_dir = dir.join("openspec/changes/test-stall3");
+        std::fs::create_dir_all(&change_dir).unwrap();
+        let tasks_path = change_dir.join("tasks.md");
+        std::fs::write(&tasks_path, "- [ ] Task one\n").unwrap();
+        let log_path = dir.join("test.log");
+
+        let config = TuiConfig {
+            command: "true {prompt}".to_string(),
+            prompt: "test {name}".to_string(),
+            ..Default::default()
+        };
+
+        let (tx, rx) = mpsc::channel();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let child_handle: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
+
+        implementation_loop(
+            "test-stall3",
+            &tasks_path,
+            &log_path,
+            &tx,
+            &cancel_flag,
+            &child_handle,
+            &config,
+        );
+
+        // Collect all messages
+        let mut messages = vec![];
+        while let Ok(msg) = rx.try_recv() {
+            messages.push(msg);
+        }
+
+        // Should have 2 Progress messages (runs 1 and 2) and then Stalled (run 3)
+        assert_eq!(messages.len(), 3);
+        assert!(matches!(
+            messages[0],
+            ImplUpdate::Progress {
+                completed: 0,
+                total: 1
+            }
+        ));
+        assert!(matches!(
+            messages[1],
+            ImplUpdate::Progress {
+                completed: 0,
+                total: 1
+            }
+        ));
+        assert!(matches!(messages[2], ImplUpdate::Stalled));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_stall_counter_resets_on_progress() {
+        // Script marks a task on the 2nd invocation (via counter file)
+        let dir = std::env::temp_dir().join("openspec-tui-test-stall-reset");
+        let change_dir = dir.join("openspec/changes/test-stall-reset");
+        std::fs::create_dir_all(&change_dir).unwrap();
+        let tasks_path = change_dir.join("tasks.md");
+        std::fs::write(&tasks_path, "- [ ] Task one\n- [ ] Task two\n").unwrap();
+        let log_path = dir.join("test.log");
+
+        let script_path = dir.join("mark_task.sh");
+        std::fs::write(
+            &script_path,
+            "#!/bin/bash\n\
+             TASKS_FILE=\"$1\"\n\
+             COUNTER_FILE=\"${TASKS_FILE}.counter\"\n\
+             count=0\n\
+             if [ -f \"$COUNTER_FILE\" ]; then count=$(cat \"$COUNTER_FILE\"); fi\n\
+             count=$((count + 1))\n\
+             echo $count > \"$COUNTER_FILE\"\n\
+             if [ \"$count\" -eq 2 ]; then\n\
+                 sed -i '0,/- \\[ \\]/s//- [x]/' \"$TASKS_FILE\"\n\
+             fi\n",
+        )
+        .unwrap();
+
+        let config = TuiConfig {
+            command: format!("bash {} {{prompt}}", script_path.display()),
+            prompt: tasks_path.to_str().unwrap().to_string(),
+            ..Default::default()
+        };
+
+        let (tx, rx) = mpsc::channel();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let child_handle: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
+
+        implementation_loop(
+            "test-stall-reset",
+            &tasks_path,
+            &log_path,
+            &tx,
+            &cancel_flag,
+            &child_handle,
+            &config,
+        );
+
+        let mut messages = vec![];
+        while let Ok(msg) = rx.try_recv() {
+            messages.push(msg);
+        }
+
+        // Expected sequence:
+        // Run 1: no progress → Progress(0,2)
+        // Run 2: marks task 1 → Progress(1,2) + stall reset
+        // Run 3: no progress → Progress(1,2)
+        // Run 4: no progress → Progress(1,2)
+        // Run 5: no progress → Stalled (stall_count=3)
+        // Total: 4 Progress + 1 Stalled = 5 messages
+        assert_eq!(messages.len(), 5, "Expected 5 messages, got: {}", messages.len());
+
+        // Verify progress was detected (proves reset happened)
+        assert!(messages.iter().any(|m| matches!(
+            m,
+            ImplUpdate::Progress {
+                completed: 1,
+                ..
+            }
+        )));
+
+        // Last message should be Stalled
+        assert!(matches!(messages.last().unwrap(), ImplUpdate::Stalled));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_loop_continues_past_failed_runs_with_eventual_progress() {
+        // Script marks the task on the 3rd invocation — loop should finish, not stall
+        let dir = std::env::temp_dir().join("openspec-tui-test-stall-continues");
+        let change_dir = dir.join("openspec/changes/test-stall-cont");
+        std::fs::create_dir_all(&change_dir).unwrap();
+        let tasks_path = change_dir.join("tasks.md");
+        std::fs::write(&tasks_path, "- [ ] Task one\n").unwrap();
+        let log_path = dir.join("test.log");
+
+        let script_path = dir.join("mark_task_late.sh");
+        std::fs::write(
+            &script_path,
+            "#!/bin/bash\n\
+             TASKS_FILE=\"$1\"\n\
+             COUNTER_FILE=\"${TASKS_FILE}.counter\"\n\
+             count=0\n\
+             if [ -f \"$COUNTER_FILE\" ]; then count=$(cat \"$COUNTER_FILE\"); fi\n\
+             count=$((count + 1))\n\
+             echo $count > \"$COUNTER_FILE\"\n\
+             if [ \"$count\" -ge 3 ]; then\n\
+                 sed -i '0,/- \\[ \\]/s//- [x]/' \"$TASKS_FILE\"\n\
+             fi\n",
+        )
+        .unwrap();
+
+        let config = TuiConfig {
+            command: format!("bash {} {{prompt}}", script_path.display()),
+            prompt: tasks_path.to_str().unwrap().to_string(),
+            ..Default::default()
+        };
+
+        let (tx, rx) = mpsc::channel();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let child_handle: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
+
+        implementation_loop(
+            "test-stall-cont",
+            &tasks_path,
+            &log_path,
+            &tx,
+            &cancel_flag,
+            &child_handle,
+            &config,
+        );
+
+        let mut messages = vec![];
+        while let Ok(msg) = rx.try_recv() {
+            messages.push(msg);
+        }
+
+        // Expected sequence:
+        // Run 1: no progress → Progress(0,1)
+        // Run 2: no progress → Progress(0,1)
+        // Run 3: marks task → Progress(1,1) → all done → Finished
+        // Total: 3 Progress + 1 Finished = 4 messages
+        assert_eq!(messages.len(), 4, "Expected 4 messages, got: {}", messages.len());
+
+        // Should end with Finished { success: true } (not Stalled)
+        assert!(matches!(messages.last().unwrap(), ImplUpdate::Finished { success: true }));
+        assert!(!messages.iter().any(|m| matches!(m, ImplUpdate::Stalled)));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

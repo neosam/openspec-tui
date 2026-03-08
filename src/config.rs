@@ -2,7 +2,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-const CONFIG_PATH: &str = "openspec/tui-config.yaml";
+pub const CONFIG_PATH: &str = "openspec/tui-config.yaml";
 const DEFAULT_COMMAND: &str = "claude --print --dangerously-skip-permissions {prompt}";
 
 const DEFAULT_PROMPT: &str = "Before implementing, read the following files for context:\n\
@@ -22,6 +22,8 @@ pub struct TuiConfig {
     pub command: String,
     #[serde(default = "default_prompt")]
     pub prompt: String,
+    #[serde(default)]
+    pub post_implementation_prompt: String,
 }
 
 fn default_command() -> String {
@@ -37,6 +39,7 @@ impl Default for TuiConfig {
         Self {
             command: default_command(),
             prompt: default_prompt(),
+            post_implementation_prompt: String::new(),
         }
     }
 }
@@ -45,6 +48,16 @@ impl TuiConfig {
     /// Replace `{name}` in the prompt template with the given change name.
     pub fn render_prompt(&self, name: &str) -> String {
         self.prompt.replace("{name}", name)
+    }
+
+    /// Replace `{name}` in the post-implementation prompt template.
+    /// Returns `None` if the prompt is empty (no hook configured).
+    pub fn render_post_prompt(&self, name: &str) -> Option<String> {
+        if self.post_implementation_prompt.is_empty() {
+            None
+        } else {
+            Some(self.post_implementation_prompt.replace("{name}", name))
+        }
     }
 
     /// Replace `{prompt}` in the command template, split on whitespace, and
@@ -157,11 +170,44 @@ mod tests {
         let config = TuiConfig {
             command: "my-tool {prompt}".to_string(),
             prompt: "do {name} stuff".to_string(),
+            ..Default::default()
         };
         let yaml = serde_yaml::to_string(&config).unwrap();
         let deserialized: TuiConfig = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(config.command, deserialized.command);
         assert_eq!(config.prompt, deserialized.prompt);
+        assert_eq!(
+            config.post_implementation_prompt,
+            deserialized.post_implementation_prompt
+        );
+    }
+
+    #[test]
+    fn test_serialize_roundtrip_with_post_prompt() {
+        let config = TuiConfig {
+            command: "my-tool {prompt}".to_string(),
+            prompt: "do {name} stuff".to_string(),
+            post_implementation_prompt: "commit {name}".to_string(),
+        };
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        let deserialized: TuiConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(
+            deserialized.post_implementation_prompt,
+            "commit {name}"
+        );
+    }
+
+    #[test]
+    fn test_deserialize_without_post_prompt_defaults_to_empty() {
+        let yaml = "command: my-tool {prompt}\nprompt: do stuff\n";
+        let config: TuiConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.post_implementation_prompt, "");
+    }
+
+    #[test]
+    fn test_default_post_implementation_prompt_is_empty() {
+        let config = TuiConfig::default();
+        assert_eq!(config.post_implementation_prompt, "");
     }
 
     mod placeholder_tests {
@@ -172,6 +218,7 @@ mod tests {
             let config = TuiConfig {
                 command: default_command(),
                 prompt: "implement {name} now".to_string(),
+                ..Default::default()
             };
             assert_eq!(config.render_prompt("my-change"), "implement my-change now");
         }
@@ -181,6 +228,7 @@ mod tests {
             let config = TuiConfig {
                 command: default_command(),
                 prompt: "{name}/proposal.md and {name}/tasks.md".to_string(),
+                ..Default::default()
             };
             assert_eq!(
                 config.render_prompt("feat"),
@@ -193,6 +241,7 @@ mod tests {
             let config = TuiConfig {
                 command: default_command(),
                 prompt: "no placeholder here".to_string(),
+                ..Default::default()
             };
             assert_eq!(config.render_prompt("x"), "no placeholder here");
         }
@@ -207,10 +256,47 @@ mod tests {
         }
 
         #[test]
+        fn test_render_post_prompt_returns_none_when_empty() {
+            let config = TuiConfig::default();
+            assert!(config.render_post_prompt("anything").is_none());
+        }
+
+        #[test]
+        fn test_render_post_prompt_replaces_name() {
+            let config = TuiConfig {
+                post_implementation_prompt: "commit changes for {name}".to_string(),
+                ..Default::default()
+            };
+            let result = config.render_post_prompt("my-change");
+            assert_eq!(result, Some("commit changes for my-change".to_string()));
+        }
+
+        #[test]
+        fn test_render_post_prompt_without_placeholder() {
+            let config = TuiConfig {
+                post_implementation_prompt: "commit all changes".to_string(),
+                ..Default::default()
+            };
+            let result = config.render_post_prompt("ignored");
+            assert_eq!(result, Some("commit all changes".to_string()));
+        }
+
+        #[test]
+        fn test_render_post_prompt_replaces_all_occurrences() {
+            let config = TuiConfig {
+                post_implementation_prompt: "{name} done, archive {name}".to_string(),
+                ..Default::default()
+            };
+            let result = config.render_post_prompt("feat");
+            assert_eq!(result, Some("feat done, archive feat".to_string()));
+        }
+
+        #[test]
         fn test_build_command_basic() {
             let config = TuiConfig {
                 command: "claude --print {prompt}".to_string(),
                 prompt: default_prompt(),
+                ..Default::default()
             };
             let (bin, args) = config.build_command("do stuff").unwrap();
             assert_eq!(bin, "claude");
@@ -233,6 +319,7 @@ mod tests {
             let config = TuiConfig {
                 command: "aider --message {prompt}".to_string(),
                 prompt: default_prompt(),
+                ..Default::default()
             };
             let (bin, args) = config.build_command("fix bug").unwrap();
             assert_eq!(bin, "aider");
@@ -244,6 +331,7 @@ mod tests {
             let config = TuiConfig {
                 command: "my-tool --flag --verbose".to_string(),
                 prompt: default_prompt(),
+                ..Default::default()
             };
             let (bin, args) = config.build_command("ignored").unwrap();
             assert_eq!(bin, "my-tool");
@@ -255,6 +343,7 @@ mod tests {
             let config = TuiConfig {
                 command: "".to_string(),
                 prompt: default_prompt(),
+                ..Default::default()
             };
             assert!(config.build_command("test").is_none());
         }
@@ -264,6 +353,7 @@ mod tests {
             let config = TuiConfig {
                 command: "my-script".to_string(),
                 prompt: default_prompt(),
+                ..Default::default()
             };
             let (bin, args) = config.build_command("test").unwrap();
             assert_eq!(bin, "my-script");
@@ -311,6 +401,7 @@ mod tests {
             let config = TuiConfig {
                 command: "test-tool {prompt}".to_string(),
                 prompt: "test prompt {name}".to_string(),
+                ..Default::default()
             };
             config.save_to(&path).unwrap();
             assert!(path.exists());
@@ -323,6 +414,7 @@ mod tests {
             let config = TuiConfig {
                 command: "my-cli --flag {prompt}".to_string(),
                 prompt: "implement {name} please".to_string(),
+                ..Default::default()
             };
             config.save_to(&path).unwrap();
             let loaded = TuiConfig::load_from(&path).unwrap();

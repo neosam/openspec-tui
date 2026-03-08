@@ -18,6 +18,7 @@ pub enum ChangeTab {
 pub enum ConfigField {
     Command,
     Prompt,
+    PostImplementationPrompt,
 }
 
 #[derive(Debug, Clone)]
@@ -45,6 +46,7 @@ pub enum Screen {
     Config {
         command: String,
         prompt: String,
+        post_implementation_prompt: String,
         cursor_position: usize,
         focused_field: ConfigField,
         editing: bool,
@@ -98,6 +100,7 @@ pub struct App {
     pub implementation: Option<ImplState>,
     pub batch: Option<BatchImplState>,
     pub config: TuiConfig,
+    pub config_path: PathBuf,
 }
 
 impl App {
@@ -122,7 +125,8 @@ impl App {
             },
         };
 
-        let config = TuiConfig::load()?;
+        let config_path = PathBuf::from(crate::config::CONFIG_PATH);
+        let config = TuiConfig::load_from(&config_path)?;
 
         Ok(App {
             screen,
@@ -131,31 +135,36 @@ impl App {
             implementation: None,
             batch: None,
             config,
+            config_path,
         })
     }
 
     pub fn poll_implementation(&mut self) {
-        let should_clear = if let Some(ref mut state) = self.implementation {
-            let mut clear = false;
+        let clear_with_success = if let Some(ref mut state) = self.implementation {
+            let mut result = None;
             while let Ok(update) = state.receiver.try_recv() {
                 match update {
                     runner::ImplUpdate::Progress { completed, total } => {
                         state.completed = completed;
                         state.total = total;
                     }
-                    runner::ImplUpdate::Finished => {
-                        clear = true;
+                    runner::ImplUpdate::Finished { success } => {
+                        result = Some(success);
+                        break;
+                    }
+                    runner::ImplUpdate::Stalled => {
+                        result = Some(false);
                         break;
                     }
                 }
             }
-            clear
+            result
         } else {
-            false
+            None
         };
-        if should_clear {
+        if let Some(success) = clear_with_success {
             self.implementation = None;
-            self.advance_batch();
+            self.advance_batch(success);
         }
     }
 
@@ -169,26 +178,15 @@ impl App {
 
     /// Advance the batch after the current implementation finishes.
     ///
-    /// Determines whether the just-finished change succeeded by reading its
-    /// task progress, then calls `BatchImplState::advance()` to get the next
-    /// change. If there is a next change, starts a new implementation for it.
-    /// If the batch is complete, clears the batch state.
-    pub fn advance_batch(&mut self) {
+    /// Advances the batch to the next change after the current one finished.
+    ///
+    /// Uses the provided `success` flag to determine whether the just-finished
+    /// change succeeded or failed, then calls `BatchImplState::advance()` to
+    /// get the next change. If there is a next change, starts a new
+    /// implementation for it. If the batch is complete, clears the batch state.
+    pub fn advance_batch(&mut self, success: bool) {
         let Some(ref mut batch) = self.batch else {
             return;
-        };
-
-        // Determine success: all tasks completed in the finished change
-        let success = if let Some(name) = batch.current_change() {
-            let tasks_path = PathBuf::from("openspec/changes")
-                .join(name)
-                .join("tasks.md");
-            match data::parse_task_progress(&tasks_path) {
-                Ok((completed, total)) => total > 0 && completed >= total,
-                Err(_) => false,
-            }
-        } else {
-            false
         };
 
         let next = batch.advance(success);
@@ -455,6 +453,7 @@ impl App {
             Screen::Config {
                 command: self.config.command.clone(),
                 prompt: self.config.prompt.clone(),
+                post_implementation_prompt: self.config.post_implementation_prompt.clone(),
                 cursor_position: self.config.command.len(),
                 focused_field: ConfigField::Command,
                 editing: false,
@@ -469,6 +468,7 @@ impl App {
         let Screen::Config {
             command,
             prompt,
+            post_implementation_prompt,
             cursor_position,
             focused_field,
             editing,
@@ -522,7 +522,8 @@ impl App {
                 KeyCode::Tab | KeyCode::BackTab => {
                     *focused_field = match focused_field {
                         ConfigField::Command => ConfigField::Prompt,
-                        ConfigField::Prompt => ConfigField::Command,
+                        ConfigField::Prompt => ConfigField::PostImplementationPrompt,
+                        ConfigField::PostImplementationPrompt => ConfigField::Command,
                     };
                     if *focused_field == ConfigField::Command {
                         *cursor_position = command.len();
@@ -539,7 +540,7 @@ impl App {
                         *cursor_position = command.len();
                         *editing = true;
                     } else {
-                        // Prompt field: signal caller to open $EDITOR
+                        // Prompt or PostImplementationPrompt field: signal caller to open $EDITOR
                         return true;
                     }
                 }
@@ -548,8 +549,9 @@ impl App {
                     let new_config = TuiConfig {
                         command: command.clone(),
                         prompt: prompt.clone(),
+                        post_implementation_prompt: post_implementation_prompt.clone(),
                     };
-                    let _ = new_config.save();
+                    let _ = new_config.save_to(&self.config_path);
                     self.config = new_config;
                     if let Some(prev) = self.screen_stack.pop() {
                         self.screen = prev;
@@ -560,6 +562,7 @@ impl App {
                     let defaults = TuiConfig::default();
                     *command = defaults.command;
                     *prompt = defaults.prompt;
+                    *post_implementation_prompt = defaults.post_implementation_prompt;
                     *cursor_position = command.len();
                     *focused_field = ConfigField::Command;
                 }
@@ -573,6 +576,13 @@ impl App {
     pub fn set_config_prompt(&mut self, new_prompt: String) {
         if let Screen::Config { prompt, .. } = &mut self.screen {
             *prompt = new_prompt;
+        }
+    }
+
+    /// Update the post-implementation prompt on the Config screen (called after $EDITOR exits).
+    pub fn set_config_post_prompt(&mut self, new_prompt: String) {
+        if let Screen::Config { post_implementation_prompt, .. } = &mut self.screen {
+            *post_implementation_prompt = new_prompt;
         }
     }
 
@@ -1078,6 +1088,7 @@ mod tests {
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         // Pressing Esc on ChangeList shouldn't crash (no parent screen)
@@ -1108,6 +1119,7 @@ mod tests {
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         app.handle_artifact_menu_input(KeyCode::Esc);
@@ -1137,6 +1149,7 @@ mod tests {
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         app.handle_artifact_view_input(KeyCode::Esc);
@@ -1177,6 +1190,7 @@ mod tests {
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         // Move down
@@ -1229,6 +1243,7 @@ mod tests {
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         // Scroll down
@@ -1299,6 +1314,7 @@ mod tests {
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         app.handle_artifact_menu_input(KeyCode::Down);
@@ -1371,6 +1387,7 @@ mod tests {
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         app.handle_artifact_menu_input(KeyCode::Enter);
@@ -1399,6 +1416,7 @@ mod tests {
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         app.handle_artifact_menu_input(KeyCode::Enter);
@@ -1420,6 +1438,7 @@ mod tests {
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         assert!(app.implementation.is_none());
@@ -1460,6 +1479,7 @@ mod tests {
             implementation: Some(existing_impl),
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         app.handle_artifact_menu_input(KeyCode::Char('R'));
@@ -1501,6 +1521,7 @@ mod tests {
             implementation: Some(existing_impl),
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         assert!(app.implementation.is_some());
@@ -1524,6 +1545,7 @@ mod tests {
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         // Should not panic when no implementation is running
@@ -1561,6 +1583,7 @@ mod tests {
             implementation: Some(existing_impl),
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         app.stop_running_implementation();
@@ -1601,6 +1624,7 @@ mod tests {
             implementation: Some(existing_impl),
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         app.stop_running_implementation();
@@ -1639,6 +1663,7 @@ mod tests {
             implementation: Some(impl_state),
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         // Send progress updates
@@ -1690,9 +1715,10 @@ mod tests {
             implementation: Some(impl_state),
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
-        tx.send(crate::runner::ImplUpdate::Finished).unwrap();
+        tx.send(crate::runner::ImplUpdate::Finished { success: true }).unwrap();
 
         app.poll_implementation();
 
@@ -1728,6 +1754,7 @@ mod tests {
             implementation: Some(impl_state),
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         // Send progress then finished
@@ -1736,7 +1763,7 @@ mod tests {
             total: 5,
         })
         .unwrap();
-        tx.send(crate::runner::ImplUpdate::Finished).unwrap();
+        tx.send(crate::runner::ImplUpdate::Finished { success: true }).unwrap();
 
         app.poll_implementation();
 
@@ -1759,6 +1786,7 @@ mod tests {
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         // Should not panic
@@ -1795,6 +1823,7 @@ mod tests {
             implementation: Some(impl_state),
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         app.poll_implementation();
@@ -1867,6 +1896,7 @@ mod tests {
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         // Navigation on empty list shouldn't panic
@@ -1896,6 +1926,7 @@ mod tests {
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         app.handle_change_list_input(KeyCode::Right);
@@ -1922,6 +1953,7 @@ mod tests {
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         app.handle_change_list_input(KeyCode::Left);
@@ -1952,6 +1984,7 @@ mod tests {
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         app.handle_change_list_input(KeyCode::Left);
@@ -1980,6 +2013,7 @@ mod tests {
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         app.handle_change_list_input(KeyCode::Right);
@@ -2005,6 +2039,7 @@ mod tests {
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         // Switch to archived with 'l'
@@ -2048,6 +2083,7 @@ mod tests {
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         app.handle_change_list_input(KeyCode::Right);
@@ -2071,6 +2107,7 @@ mod tests {
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         app.handle_artifact_menu_input(KeyCode::Char('R'));
@@ -2095,6 +2132,7 @@ mod tests {
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         app.handle_artifact_menu_input(KeyCode::Char('R'));
@@ -2119,6 +2157,7 @@ mod tests {
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         let dir = app.find_change_dir("my-change", false);
@@ -2141,6 +2180,7 @@ mod tests {
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         let dir = app.find_change_dir("2026-03-06-my-change", true);
@@ -2166,6 +2206,7 @@ mod tests {
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         app.handle_artifact_menu_input(KeyCode::Char('L'));
@@ -2208,6 +2249,7 @@ mod tests {
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         app.handle_artifact_menu_input(KeyCode::Char('L'));
@@ -2240,6 +2282,7 @@ mod tests {
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         app.handle_artifact_menu_input(KeyCode::Char('L'));
@@ -2274,6 +2317,7 @@ mod tests {
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         app.handle_artifact_menu_input(KeyCode::Char('R'));
@@ -2312,6 +2356,7 @@ mod tests {
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         app.handle_artifact_menu_input(KeyCode::Char('R'));
@@ -2343,7 +2388,9 @@ mod tests {
             config: TuiConfig {
                 command: "test-tool {prompt}".to_string(),
                 prompt: "test prompt {name}".to_string(),
+                ..Default::default()
             },
+            config_path: std::env::temp_dir().join("openspec-tui-test-config.yaml"),
         }
     }
 
@@ -2371,6 +2418,7 @@ mod tests {
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
         app.handle_artifact_menu_input(KeyCode::Char('C'));
         assert!(matches!(app.screen, Screen::Config { .. }));
@@ -2390,6 +2438,7 @@ mod tests {
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
         app.handle_artifact_view_input(KeyCode::Char('C'));
         assert!(matches!(app.screen, Screen::Config { .. }));
@@ -2460,7 +2509,13 @@ mod tests {
             assert_eq!(*focused_field, ConfigField::Prompt);
         }
 
-        // Tab -> Command
+        // Tab -> PostImplementationPrompt
+        app.handle_config_input(KeyCode::Tab);
+        if let Screen::Config { focused_field, .. } = &app.screen {
+            assert_eq!(*focused_field, ConfigField::PostImplementationPrompt);
+        }
+
+        // Tab -> Command (wraps around)
         app.handle_config_input(KeyCode::Tab);
         if let Screen::Config { focused_field, .. } = &app.screen {
             assert_eq!(*focused_field, ConfigField::Command);
@@ -2779,6 +2834,131 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_config_reset_includes_post_implementation_prompt() {
+        let mut app = make_config_app();
+        app.config.post_implementation_prompt = "commit {name}".to_string();
+        app.push_config_screen();
+
+        // Verify it's loaded
+        if let Screen::Config { post_implementation_prompt, .. } = &app.screen {
+            assert_eq!(post_implementation_prompt, "commit {name}");
+        } else {
+            panic!("Expected Config screen");
+        }
+
+        // Reset to defaults
+        app.handle_config_input(KeyCode::Char('D'));
+        if let Screen::Config { post_implementation_prompt, .. } = &app.screen {
+            assert_eq!(post_implementation_prompt, "", "Post-impl prompt should be empty after reset");
+        } else {
+            panic!("Expected Config screen");
+        }
+    }
+
+    #[test]
+    fn test_config_save_includes_post_implementation_prompt() {
+        let mut app = make_config_app();
+        app.config.post_implementation_prompt = "commit {name}".to_string();
+        app.push_config_screen();
+
+        // Save
+        app.handle_config_input(KeyCode::Char('S'));
+        assert_eq!(app.config.post_implementation_prompt, "commit {name}");
+    }
+
+    #[test]
+    fn test_config_enter_on_post_prompt_opens_editor() {
+        let mut app = make_config_app();
+        app.push_config_screen();
+
+        // Navigate to PostImplementationPrompt
+        app.handle_config_input(KeyCode::Tab); // -> Prompt
+        app.handle_config_input(KeyCode::Tab); // -> PostImplementationPrompt
+
+        if let Screen::Config { focused_field, .. } = &app.screen {
+            assert_eq!(*focused_field, ConfigField::PostImplementationPrompt);
+        }
+
+        // Enter on PostImplementationPrompt should signal editor
+        let result = app.handle_config_input(KeyCode::Enter);
+        assert!(result, "Enter on PostImplementationPrompt field should return true for editor");
+    }
+
+    #[test]
+    fn test_set_config_post_prompt() {
+        let mut app = make_config_app();
+        app.push_config_screen();
+
+        app.set_config_post_prompt("commit all changes".to_string());
+        if let Screen::Config { post_implementation_prompt, .. } = &app.screen {
+            assert_eq!(post_implementation_prompt, "commit all changes");
+        } else {
+            panic!("Expected Config screen");
+        }
+    }
+
+    #[test]
+    fn test_advance_batch_with_explicit_success() {
+        let batch = BatchImplState::new(
+            vec!["change-a".to_string(), "change-b".to_string()],
+            HashMap::new(),
+        );
+        let mut app = App {
+            screen: Screen::ChangeList {
+                changes: vec![],
+                selected: 0,
+                error: None,
+                tab: ChangeTab::Active,
+                change_deps: HashMap::new(),
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: None,
+            batch: Some(batch),
+            config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
+        };
+
+        // advance with success=true should mark change-a as completed
+        app.advance_batch(true);
+        let batch = app.batch.as_ref().unwrap();
+        assert!(batch.completed.contains("change-a"));
+        assert!(!batch.failed.contains("change-a"));
+
+        // Clean up spawned implementation thread
+        app.stop_running_implementation();
+    }
+
+    #[test]
+    fn test_advance_batch_with_explicit_failure() {
+        let mut deps = HashMap::new();
+        deps.insert("change-b".to_string(), vec!["change-a".to_string()]);
+        let batch = BatchImplState::new(
+            vec!["change-a".to_string(), "change-b".to_string()],
+            deps,
+        );
+        let mut app = App {
+            screen: Screen::ChangeList {
+                changes: vec![],
+                selected: 0,
+                error: None,
+                tab: ChangeTab::Active,
+                change_deps: HashMap::new(),
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: None,
+            batch: Some(batch),
+            config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
+        };
+
+        // advance with success=false should mark change-a as failed and skip change-b
+        app.advance_batch(false);
+        assert!(app.batch.is_none(), "Batch should be finished since change-b is skipped");
+    }
+
     // --- Dependency View Tests ---
 
     fn make_dependency_view_app(deps: Vec<&str>) -> App {
@@ -2794,6 +2974,7 @@ mod tests {
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         }
     }
 
@@ -2851,6 +3032,7 @@ mod tests {
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         // Remove dep-b (selected=1)
@@ -2880,6 +3062,7 @@ mod tests {
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         // Remove dep-b (last item, selected=1)
@@ -2924,6 +3107,7 @@ mod tests {
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         app.handle_dependency_view_input(KeyCode::Esc);
@@ -2947,6 +3131,7 @@ mod tests {
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         app.handle_dependency_add_input(KeyCode::Char('j'));
@@ -2995,6 +3180,7 @@ mod tests {
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         app.handle_dependency_add_input(KeyCode::Enter);
@@ -3031,6 +3217,7 @@ mod tests {
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         app.handle_dependency_add_input(KeyCode::Esc);
@@ -3139,6 +3326,7 @@ mod tests {
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         app.handle_artifact_menu_input(KeyCode::Enter);
@@ -3177,6 +3365,7 @@ mod tests {
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         // Scroll down
@@ -3228,6 +3417,7 @@ mod tests {
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         app.handle_dependency_graph_input(KeyCode::Esc);
@@ -3266,6 +3456,7 @@ mod tests {
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         app.handle_change_list_input(KeyCode::Char('G'));
@@ -3288,6 +3479,7 @@ mod tests {
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         app.handle_change_list_input(KeyCode::Char('G'));
@@ -3315,6 +3507,7 @@ mod tests {
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         }
     }
 
@@ -3453,6 +3646,7 @@ mod tests {
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         app.handle_change_list_input(KeyCode::Char('A'));
@@ -3475,6 +3669,7 @@ mod tests {
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         app.handle_change_list_input(KeyCode::Char('A'));
@@ -3516,6 +3711,7 @@ mod tests {
             implementation: Some(existing_impl),
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         app.handle_change_list_input(KeyCode::Char('A'));
@@ -3615,9 +3811,10 @@ mod tests {
             implementation: Some(impl_state),
             batch: Some(batch),
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
-        tx.send(crate::runner::ImplUpdate::Finished).unwrap();
+        tx.send(crate::runner::ImplUpdate::Finished { success: true }).unwrap();
         app.poll_implementation();
 
         // Implementation should be cleared
@@ -3661,9 +3858,10 @@ mod tests {
             implementation: Some(impl_state),
             batch: Some(batch),
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
-        tx.send(crate::runner::ImplUpdate::Finished).unwrap();
+        tx.send(crate::runner::ImplUpdate::Finished { success: true }).unwrap();
         app.poll_implementation();
 
         // Implementation should be started for change-b
@@ -3721,9 +3919,11 @@ mod tests {
             implementation: Some(impl_state),
             batch: Some(batch),
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
-        tx.send(crate::runner::ImplUpdate::Finished).unwrap();
+        // Send failure — change-a failed
+        tx.send(crate::runner::ImplUpdate::Finished { success: false }).unwrap();
         app.poll_implementation();
 
         // change-b should be skipped (depends on failed change-a),
@@ -3771,9 +3971,10 @@ mod tests {
             implementation: Some(impl_state),
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
-        tx.send(crate::runner::ImplUpdate::Finished).unwrap();
+        tx.send(crate::runner::ImplUpdate::Finished { success: true }).unwrap();
         app.poll_implementation();
 
         // Implementation cleared, no batch started
@@ -3835,6 +4036,7 @@ mod tests {
             implementation: Some(existing_impl),
             batch: Some(batch),
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         assert!(app.implementation.is_some());
@@ -3868,6 +4070,7 @@ mod tests {
             implementation: None,
             batch: Some(batch),
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         app.stop_running_implementation();
@@ -3906,11 +4109,77 @@ mod tests {
             implementation: Some(existing_impl),
             batch: None,
             config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
         };
 
         // Stopping a single run without batch should work fine
         app.stop_running_implementation();
         assert!(app.implementation.is_none());
         assert!(app.batch.is_none());
+    }
+
+    #[test]
+    fn test_poll_implementation_stalled_treats_as_failure_skips_dependents() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{mpsc, Arc, Mutex};
+
+        let (tx, rx) = mpsc::channel();
+        let impl_state = crate::runner::ImplState {
+            change_name: "change-a".to_string(),
+            completed: 0,
+            total: 5,
+            log_path: PathBuf::from("/tmp/test.log"),
+            receiver: rx,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            child_handle: Arc::new(Mutex::new(None)),
+        };
+
+        // change-b depends on change-a, change-c is independent
+        let mut deps = HashMap::new();
+        deps.insert("change-b".to_string(), vec!["change-a".to_string()]);
+        let batch = BatchImplState::new(
+            vec![
+                "change-a".to_string(),
+                "change-b".to_string(),
+                "change-c".to_string(),
+            ],
+            deps,
+        );
+
+        let mut app = App {
+            screen: Screen::ChangeList {
+                changes: vec![],
+                selected: 0,
+                error: None,
+                tab: ChangeTab::Active,
+                change_deps: HashMap::new(),
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: Some(impl_state),
+            batch: Some(batch),
+            config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
+        };
+
+        // Send Stalled (not Finished) — should be treated as failure
+        tx.send(crate::runner::ImplUpdate::Stalled).unwrap();
+        app.poll_implementation();
+
+        // Implementation should be cleared
+        assert!(app.implementation.is_some());
+        // change-b should be skipped (depends on failed change-a),
+        // change-c should be started (independent)
+        assert_eq!(
+            app.implementation.as_ref().unwrap().change_name,
+            "change-c"
+        );
+        let batch = app.batch.as_ref().unwrap();
+        assert!(batch.failed.contains("change-a"));
+        assert!(batch.skipped.contains("change-b"));
+        assert_eq!(batch.current_index, 2);
+
+        // Clean up spawned implementation thread
+        app.stop_running_implementation();
     }
 }
