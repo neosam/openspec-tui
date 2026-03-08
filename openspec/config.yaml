@@ -23,6 +23,8 @@ context: |
   - Tests use tempdir for filesystem operations
   - Cross-platform support (Windows cmd wrapper for openspec CLI)
   - No async runtime — uses threads + mpsc for concurrency
+  - The project must compile without warnings
+  - Clippy must always pass without warnings
 
 rules:
   proposal:

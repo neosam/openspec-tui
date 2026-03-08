@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
@@ -58,16 +58,6 @@ impl BatchImplState {
             skipped: HashSet::new(),
             deps,
         }
-    }
-
-    /// Returns the name of the currently running change, if any.
-    pub fn current_change(&self) -> Option<&str> {
-        self.queue.get(self.current_index).map(|s| s.as_str())
-    }
-
-    /// Returns true if the batch has finished (all changes processed).
-    pub fn is_finished(&self) -> bool {
-        self.current_index >= self.queue.len()
     }
 
     /// Returns the total number of changes in the batch.
@@ -132,14 +122,27 @@ impl BatchImplState {
     }
 }
 
+#[cfg(test)]
+impl BatchImplState {
+    /// Returns the name of the currently running change, if any.
+    pub fn current_change(&self) -> Option<&str> {
+        self.queue.get(self.current_index).map(|s| s.as_str())
+    }
+
+    /// Returns true if the batch has finished (all changes processed).
+    pub fn is_finished(&self) -> bool {
+        self.current_index >= self.queue.len()
+    }
+}
+
 /// Stop a running implementation by setting the cancel flag and killing the
 /// active child process.
 pub fn stop_implementation(state: &ImplState) {
     state.cancel_flag.store(true, Ordering::Relaxed);
-    if let Ok(mut handle) = state.child_handle.lock() {
-        if let Some(ref mut child) = *handle {
-            let _ = child.kill();
-        }
+    if let Ok(mut handle) = state.child_handle.lock()
+        && let Some(ref mut child) = *handle
+    {
+        let _ = child.kill();
     }
 }
 
@@ -194,7 +197,7 @@ pub fn start_implementation(change_name: &str, config: &TuiConfig) -> ImplState 
 }
 
 fn write_task_header(
-    log_path: &PathBuf,
+    log_path: &Path,
     task_number: u32,
     total: u32,
     task_text: &str,
@@ -209,7 +212,7 @@ fn write_task_header(
     Ok(())
 }
 
-fn write_run_header(log_path: &PathBuf, change_name: &str) -> Result<(), std::io::Error> {
+fn write_run_header(log_path: &Path, change_name: &str) -> Result<(), std::io::Error> {
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -362,8 +365,8 @@ const STALL_THRESHOLD: u32 = 3;
 
 fn implementation_loop(
     change_name: &str,
-    tasks_path: &PathBuf,
-    log_path: &PathBuf,
+    tasks_path: &Path,
+    log_path: &Path,
     tx: &mpsc::Sender<ImplUpdate>,
     cancel_flag: &Arc<AtomicBool>,
     child_handle: &Arc<Mutex<Option<Child>>>,
@@ -523,72 +526,71 @@ fn implementation_loop(
 
     // Run post-implementation hook if tasks completed successfully
     let mut success = tasks_complete;
-    if tasks_complete {
-        if let Some(post_prompt) = config.render_post_prompt(change_name) {
-            if let Some((binary, args)) = config.build_command(&post_prompt) {
-                // Open log file for hook output
-                let hook_ok = match OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(log_path)
-                {
-                    Ok(log_file) => {
-                        match log_file.try_clone() {
-                            Ok(stderr_log) => {
-                                match std::process::Command::new(&binary)
-                                    .args(&args)
-                                    .stdout(Stdio::from(log_file))
-                                    .stderr(Stdio::from(stderr_log))
-                                    .spawn()
+    if tasks_complete
+        && let Some(post_prompt) = config.render_post_prompt(change_name)
+        && let Some((binary, args)) = config.build_command(&post_prompt)
+    {
+        // Open log file for hook output
+        let hook_ok = match OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+        {
+            Ok(log_file) => {
+                match log_file.try_clone() {
+                    Ok(stderr_log) => {
+                        match std::process::Command::new(&binary)
+                            .args(&args)
+                            .stdout(Stdio::from(log_file))
+                            .stderr(Stdio::from(stderr_log))
+                            .spawn()
+                        {
+                            Ok(child) => {
+                                // Store child handle for cancellation
                                 {
-                                    Ok(child) => {
-                                        // Store child handle for cancellation
-                                        {
-                                            let mut handle = child_handle.lock().unwrap();
-                                            *handle = Some(child);
-                                        }
-                                        // Poll for completion
-                                        let exited_ok = loop {
-                                            if cancel_flag.load(Ordering::Relaxed) {
-                                                break false;
-                                            }
-                                            let try_result = {
-                                                let mut handle = child_handle.lock().unwrap();
-                                                if let Some(ref mut c) = *handle {
-                                                    c.try_wait()
-                                                } else {
-                                                    break false;
-                                                }
-                                            };
-                                            match try_result {
-                                                Ok(Some(status)) => break status.success(),
-                                                Ok(None) => {
-                                                    std::thread::sleep(
-                                                        std::time::Duration::from_millis(100),
-                                                    );
-                                                }
-                                                Err(_) => break false,
-                                            }
-                                        };
-                                        // Clear child handle
-                                        {
-                                            let mut handle = child_handle.lock().unwrap();
-                                            *handle = None;
-                                        }
-                                        exited_ok
-                                    }
-                                    Err(_) => false,
+                                    let mut handle = child_handle.lock().unwrap();
+                                    *handle = Some(child);
                                 }
+                                // Poll for completion
+                                let exited_ok = loop {
+                                    if cancel_flag.load(Ordering::Relaxed) {
+                                        break false;
+                                    }
+                                    let try_result = {
+                                        let mut handle = child_handle.lock().unwrap();
+                                        if let Some(ref mut c) = *handle {
+                                            c.try_wait()
+                                        } else {
+                                            break false;
+                                        }
+                                    };
+                                    match try_result {
+                                        Ok(Some(status)) => break status.success(),
+                                        Ok(None) => {
+                                            std::thread::sleep(
+                                                std::time::Duration::from_millis(100),
+                                            );
+                                        }
+                                        Err(_) => break false,
+                                    }
+                                };
+                                // Clear child handle
+                                {
+                                    let mut handle = child_handle.lock().unwrap();
+                                    *handle = None;
+                                }
+                                exited_ok
                             }
                             Err(_) => false,
                         }
                     }
                     Err(_) => false,
-                };
-                if !hook_ok {
-                    success = false;
                 }
             }
+            Err(_) => false,
+        };
+        if !hook_ok {
+            success = false;
         }
     }
 

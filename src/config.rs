@@ -97,11 +97,6 @@ impl TuiConfig {
         Some((first.to_string(), rest.iter().map(|s| s.to_string()).collect()))
     }
 
-    /// Load config from `openspec/tui-config.yaml`. Falls back to defaults if file is missing.
-    pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
-        Self::load_from(Path::new(CONFIG_PATH))
-    }
-
     /// Load config from a specific path. Falls back to defaults if file is missing.
     pub fn load_from(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         if !path.exists() {
@@ -110,11 +105,6 @@ impl TuiConfig {
         let contents = std::fs::read_to_string(path)?;
         let config: TuiConfig = serde_yaml::from_str(&contents)?;
         Ok(config)
-    }
-
-    /// Save config to `openspec/tui-config.yaml`.
-    pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
-        self.save_to(Path::new(CONFIG_PATH))
     }
 
     /// Save config to a specific path.

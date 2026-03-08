@@ -16,15 +16,12 @@ pub struct ChangeEntry {
     pub name: String,
     pub completed_tasks: u32,
     pub total_tasks: u32,
-    pub status: String,
 }
 
 // Types for `openspec status --change <name> --json`
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ChangeStatusOutput {
-    pub change_name: String,
-    pub schema_name: String,
     pub artifacts: Vec<ArtifactStatus>,
 }
 
@@ -32,7 +29,6 @@ pub struct ChangeStatusOutput {
 #[serde(rename_all = "camelCase")]
 pub struct ArtifactStatus {
     pub id: String,
-    pub output_path: String,
     pub status: String,
 }
 
@@ -132,7 +128,6 @@ pub fn list_archived_changes() -> Result<Vec<ChangeEntry>, String> {
                 name,
                 completed_tasks,
                 total_tasks,
-                status: "archived".to_string(),
             })
         })
         .collect();
@@ -160,11 +155,6 @@ pub fn list_archived_changes() -> Result<Vec<ChangeEntry>, String> {
 /// Instead of calling `openspec status`, checks which artifact files exist in the
 /// archive directory. All existing files are treated as "done".
 pub fn get_archived_change_status(change_dir: &Path) -> ChangeStatusOutput {
-    let change_name = change_dir
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default();
-
     let artifact_checks = [
         ("proposal", "proposal.md"),
         ("design", "design.md"),
@@ -181,7 +171,6 @@ pub fn get_archived_change_status(change_dir: &Path) -> ChangeStatusOutput {
             };
             ArtifactStatus {
                 id: id.to_string(),
-                output_path: filename.to_string(),
                 status: status.to_string(),
             }
         })
@@ -196,13 +185,10 @@ pub fn get_archived_change_status(change_dir: &Path) -> ChangeStatusOutput {
     };
     artifacts.push(ArtifactStatus {
         id: "specs".to_string(),
-        output_path: "specs/**/*.md".to_string(),
         status: specs_status.to_string(),
     });
 
     ChangeStatusOutput {
-        change_name,
-        schema_name: "spec-driven".to_string(),
         artifacts,
     }
 }
@@ -312,10 +298,7 @@ pub fn read_change_config(change_dir: &Path) -> ChangeConfig {
         Ok(c) => c,
         Err(_) => return ChangeConfig::default(),
     };
-    match serde_yaml::from_str(&content) {
-        Ok(c) => c,
-        Err(_) => ChangeConfig::default(),
-    }
+    serde_yaml::from_str(&content).unwrap_or_default()
 }
 
 /// Read dependencies for a change from its `change-config.yaml` file.
@@ -656,7 +639,6 @@ mod tests {
         assert_eq!(result.changes[0].name, "tui-change-viewer");
         assert_eq!(result.changes[0].completed_tasks, 3);
         assert_eq!(result.changes[0].total_tasks, 21);
-        assert_eq!(result.changes[0].status, "in-progress");
     }
 
     #[test]
@@ -698,8 +680,6 @@ mod tests {
         }"#;
 
         let result: ChangeStatusOutput = serde_json::from_str(json).unwrap();
-        assert_eq!(result.change_name, "tui-change-viewer");
-        assert_eq!(result.schema_name, "spec-driven");
         assert_eq!(result.artifacts.len(), 4);
         assert_eq!(result.artifacts[0].id, "proposal");
         assert_eq!(result.artifacts[0].status, "done");
@@ -1422,18 +1402,16 @@ mod tests {
         )
         .unwrap();
 
-        let changes = vec![
+        let _changes = vec![
             ChangeEntry {
                 name: "change-a".to_string(),
                 completed_tasks: 0,
                 total_tasks: 1,
-                status: "in-progress".to_string(),
             },
             ChangeEntry {
                 name: "change-b".to_string(),
                 completed_tasks: 0,
                 total_tasks: 1,
-                status: "in-progress".to_string(),
             },
         ];
 

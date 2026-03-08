@@ -1,6 +1,6 @@
 use crossterm::event::KeyCode;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::config::TuiConfig;
 use crate::data::{self, ChangeEntry, ChangeStatusOutput, RunMode};
@@ -1174,16 +1174,16 @@ pub fn build_run_all_entries(changes: &[data::ChangeEntry]) -> Vec<RunAllEntry> 
     let change_names: std::collections::HashSet<String> =
         entries.iter().map(|e| e.change_name.clone()).collect();
 
-    for i in 0..entries.len() {
-        let dir = changes_dir.join(&entries[i].change_name);
+    for entry in &mut entries {
+        let dir = changes_dir.join(&entry.change_name);
         let deps = data::read_dependencies(&dir);
         for dep in &deps {
             let in_list = change_names.contains(dep);
             let is_archived = archived.contains(dep);
             if !in_list && !is_archived {
-                entries[i].blocked = true;
-                entries[i].blocked_by = Some(dep.clone());
-                entries[i].included = false;
+                entry.blocked = true;
+                entry.blocked_by = Some(dep.clone());
+                entry.included = false;
                 break;
             }
         }
@@ -1241,7 +1241,7 @@ fn recalculate_blocked(entries: &mut [RunAllEntry]) {
 
 pub fn build_artifact_menu_items(
     status: &ChangeStatusOutput,
-    change_dir: &PathBuf,
+    change_dir: &Path,
     is_archived: bool,
 ) -> Vec<ArtifactMenuItem> {
     let mut items = Vec::new();
@@ -1330,13 +1330,10 @@ mod tests {
 
     fn make_status(artifacts: Vec<(&str, &str)>) -> ChangeStatusOutput {
         ChangeStatusOutput {
-            change_name: "test-change".to_string(),
-            schema_name: "spec-driven".to_string(),
             artifacts: artifacts
                 .into_iter()
                 .map(|(id, status)| ArtifactStatus {
                     id: id.to_string(),
-                    output_path: String::new(),
                     status: status.to_string(),
                 })
                 .collect(),
@@ -1351,7 +1348,7 @@ mod tests {
                     name: "test".to_string(),
                     completed_tasks: 0,
                     total_tasks: 5,
-                    status: "in-progress".to_string(),
+
                 }],
                 selected: 0,
                 error: None,
@@ -1444,19 +1441,19 @@ mod tests {
                         name: "a".to_string(),
                         completed_tasks: 0,
                         total_tasks: 1,
-                        status: "in-progress".to_string(),
+    
                     },
                     ChangeEntry {
                         name: "b".to_string(),
                         completed_tasks: 0,
                         total_tasks: 1,
-                        status: "in-progress".to_string(),
+    
                     },
                     ChangeEntry {
                         name: "c".to_string(),
                         completed_tasks: 0,
                         total_tasks: 1,
-                        status: "in-progress".to_string(),
+    
                     },
                 ],
                 selected: 0,
@@ -2212,7 +2209,7 @@ mod tests {
                     name: "active-change".to_string(),
                     completed_tasks: 0,
                     total_tasks: 1,
-                    status: "in-progress".to_string(),
+
                 }],
                 selected: 0,
                 error: None,
@@ -2272,7 +2269,7 @@ mod tests {
                     name: "test".to_string(),
                     completed_tasks: 0,
                     total_tasks: 1,
-                    status: "in-progress".to_string(),
+
                 }],
                 selected: 0,
                 error: None,
@@ -2367,13 +2364,13 @@ mod tests {
                         name: "a".to_string(),
                         completed_tasks: 0,
                         total_tasks: 1,
-                        status: "in-progress".to_string(),
+    
                     },
                     ChangeEntry {
                         name: "b".to_string(),
                         completed_tasks: 0,
                         total_tasks: 1,
-                        status: "in-progress".to_string(),
+    
                     },
                 ],
                 selected: 1,
@@ -4206,13 +4203,13 @@ mod tests {
                         name: "a".to_string(),
                         completed_tasks: 0,
                         total_tasks: 1,
-                        status: "in-progress".to_string(),
+    
                     },
                     ChangeEntry {
                         name: "b".to_string(),
                         completed_tasks: 0,
                         total_tasks: 1,
-                        status: "in-progress".to_string(),
+    
                     },
                 ],
                 selected: 0,
@@ -4266,7 +4263,7 @@ mod tests {
                     name: "test".to_string(),
                     completed_tasks: 0,
                     total_tasks: 5,
-                    status: "in-progress".to_string(),
+
                 }],
                 selected: 0,
                 error: None,
@@ -4331,7 +4328,7 @@ mod tests {
                     name: "test".to_string(),
                     completed_tasks: 0,
                     total_tasks: 5,
-                    status: "in-progress".to_string(),
+
                 }],
                 selected: 0,
                 error: None,
@@ -4499,7 +4496,7 @@ mod tests {
                     name: "test".to_string(),
                     completed_tasks: 0,
                     total_tasks: 5,
-                    status: "in-progress".to_string(),
+
                 }],
                 selected: 0,
                 error: None,
@@ -4566,7 +4563,7 @@ mod tests {
                     name: "test".to_string(),
                     completed_tasks: 0,
                     total_tasks: 5,
-                    status: "in-progress".to_string(),
+
                 }],
                 selected: 0,
                 error: None,
@@ -5446,9 +5443,9 @@ mod tests {
         let mut app = App {
             screen: Screen::ChangeList {
                 changes: vec![
-                    ChangeEntry { name: "a".to_string(), completed_tasks: 0, total_tasks: 1, status: "in-progress".to_string() },
-                    ChangeEntry { name: "b".to_string(), completed_tasks: 0, total_tasks: 1, status: "in-progress".to_string() },
-                    ChangeEntry { name: "c".to_string(), completed_tasks: 0, total_tasks: 1, status: "in-progress".to_string() },
+                    ChangeEntry { name: "a".to_string(), completed_tasks: 0, total_tasks: 1 },
+                    ChangeEntry { name: "b".to_string(), completed_tasks: 0, total_tasks: 1 },
+                    ChangeEntry { name: "c".to_string(), completed_tasks: 0, total_tasks: 1 },
                 ],
                 selected: 2,
                 error: None,

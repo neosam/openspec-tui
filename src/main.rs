@@ -108,87 +108,87 @@ fn run_app(terminal: &mut ratatui::Terminal<CrosstermBackend<io::Stdout>>) -> Re
 
         app.poll_implementation();
 
-        if event::poll(Duration::from_millis(500))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
+        if event::poll(Duration::from_millis(500))?
+            && let Event::Key(key) = event::read()?
+        {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
 
-                // In Config screen, all keys go to the config handler
-                if matches!(app.screen, Screen::Config { .. }) {
-                    let open_editor = app.handle_config_input(key.code);
-                    if open_editor {
-                        if let Screen::Config { prompt, post_implementation_prompt, focused_field, .. } = &app.screen {
-                            let (content, is_post_prompt) = match focused_field {
-                                app::ConfigField::PostImplementationPrompt => {
-                                    (post_implementation_prompt.clone(), true)
-                                }
-                                _ => (prompt.clone(), false),
-                            };
-                            if let Ok(new_text) = edit_in_external_editor(terminal, &content) {
-                                if is_post_prompt {
-                                    app.set_config_post_prompt(new_text);
-                                } else {
-                                    app.set_config_prompt(new_text);
-                                }
-                            }
+            // In Config screen, all keys go to the config handler
+            if matches!(app.screen, Screen::Config { .. }) {
+                let open_editor = app.handle_config_input(key.code);
+                if open_editor
+                    && let Screen::Config { prompt, post_implementation_prompt, focused_field, .. } = &app.screen
+                {
+                    let (content, is_post_prompt) = match focused_field {
+                        app::ConfigField::PostImplementationPrompt => {
+                            (post_implementation_prompt.clone(), true)
+                        }
+                        _ => (prompt.clone(), false),
+                    };
+                    if let Ok(new_text) = edit_in_external_editor(terminal, &content) {
+                        if is_post_prompt {
+                            app.set_config_post_prompt(new_text);
+                        } else {
+                            app.set_config_prompt(new_text);
                         }
                     }
-                    if app.should_quit {
-                        return Ok(());
-                    }
-                    continue;
                 }
-
-                if key.code == KeyCode::Char('q') {
-                    return Ok(());
-                }
-
-                if key.code == KeyCode::Char('S') {
-                    app.stop_running_implementation();
-                    continue;
-                }
-
-                if key.code == KeyCode::Char('r') {
-                    app.refresh_screen();
-                    continue;
-                }
-
-                match &app.screen {
-                    Screen::ChangeList { .. } => {
-                        app.handle_change_list_input(key.code);
-                        if app.launch_interactive {
-                            app.launch_interactive = false;
-                            launch_interactive_tool(terminal, &app.config)?;
-                            app.reload_changes();
-                        }
-                    }
-                    Screen::ArtifactMenu { .. } => {
-                        app.handle_artifact_menu_input(key.code);
-                    }
-                    Screen::ArtifactView { .. } => {
-                        app.handle_artifact_view_input(key.code);
-                    }
-                    Screen::DependencyView { .. } => {
-                        app.handle_dependency_view_input(key.code);
-                    }
-                    Screen::DependencyAdd { .. } => {
-                        app.handle_dependency_add_input(key.code);
-                    }
-                    Screen::DependencyGraph { .. } => {
-                        app.handle_dependency_graph_input(key.code);
-                    }
-                    Screen::RunAllSelection { .. } => {
-                        app.handle_run_all_selection_input(key.code);
-                    }
-                    Screen::Config { .. } => {
-                        // Handled above
-                    }
-                }
-
                 if app.should_quit {
                     return Ok(());
                 }
+                continue;
+            }
+
+            if key.code == KeyCode::Char('q') {
+                return Ok(());
+            }
+
+            if key.code == KeyCode::Char('S') {
+                app.stop_running_implementation();
+                continue;
+            }
+
+            if key.code == KeyCode::Char('r') {
+                app.refresh_screen();
+                continue;
+            }
+
+            match &app.screen {
+                Screen::ChangeList { .. } => {
+                    app.handle_change_list_input(key.code);
+                    if app.launch_interactive {
+                        app.launch_interactive = false;
+                        launch_interactive_tool(terminal, &app.config)?;
+                        app.reload_changes();
+                    }
+                }
+                Screen::ArtifactMenu { .. } => {
+                    app.handle_artifact_menu_input(key.code);
+                }
+                Screen::ArtifactView { .. } => {
+                    app.handle_artifact_view_input(key.code);
+                }
+                Screen::DependencyView { .. } => {
+                    app.handle_dependency_view_input(key.code);
+                }
+                Screen::DependencyAdd { .. } => {
+                    app.handle_dependency_add_input(key.code);
+                }
+                Screen::DependencyGraph { .. } => {
+                    app.handle_dependency_graph_input(key.code);
+                }
+                Screen::RunAllSelection { .. } => {
+                    app.handle_run_all_selection_input(key.code);
+                }
+                Screen::Config { .. } => {
+                    // Handled above
+                }
+            }
+
+            if app.should_quit {
+                return Ok(());
             }
         }
     }

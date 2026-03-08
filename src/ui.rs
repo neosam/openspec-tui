@@ -52,7 +52,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
             cursor_position,
             focused_field,
             editing,
-        } => draw_config_screen(frame, command, prompt, post_implementation_prompt, interactive_command, run_finished_command, *cursor_position, focused_field, *editing, content_area),
+        } => draw_config_screen(frame, &ConfigScreenParams {
+            command, prompt, post_implementation_prompt, interactive_command,
+            run_finished_command, cursor_position: *cursor_position,
+            focused_field, editing: *editing,
+        }, content_area),
         Screen::DependencyView {
             change_name,
             dependencies,
@@ -167,24 +171,24 @@ fn draw_change_list(
                 ),
             ];
 
-            if let Some(deps) = change_deps.get(&change.name) {
-                if !deps.is_empty() {
-                    let dep_str = format!("<- {}", deps.join(", "));
-                    // Need at least 3 chars of space before dep string (for "   ")
-                    let available = inner_width.saturating_sub(left_len + 3);
-                    let truncated = if dep_str.len() > available && available > 3 {
-                        format!("{}...", &dep_str[..available - 3])
-                    } else if dep_str.len() > available {
-                        String::new()
-                    } else {
-                        dep_str
-                    };
-                    if !truncated.is_empty() {
-                        spans.push(Span::styled(
-                            format!("   {}", truncated),
-                            Style::default().fg(Color::DarkGray),
-                        ));
-                    }
+            if let Some(deps) = change_deps.get(&change.name)
+                && !deps.is_empty()
+            {
+                let dep_str = format!("<- {}", deps.join(", "));
+                // Need at least 3 chars of space before dep string (for "   ")
+                let available = inner_width.saturating_sub(left_len + 3);
+                let truncated = if dep_str.len() > available && available > 3 {
+                    format!("{}...", &dep_str[..available - 3])
+                } else if dep_str.len() > available {
+                    String::new()
+                } else {
+                    dep_str
+                };
+                if !truncated.is_empty() {
+                    spans.push(Span::styled(
+                        format!("   {}", truncated),
+                        Style::default().fg(Color::DarkGray),
+                    ));
                 }
             }
 
@@ -221,9 +225,7 @@ fn draw_artifact_menu(
         .iter()
         .enumerate()
         .map(|(i, item)| {
-            let style = if !item.available && !item.is_spec_header {
-                Style::default().fg(Color::DarkGray)
-            } else if item.is_spec_header && !item.available {
+            let style = if !item.available {
                 Style::default().fg(Color::DarkGray)
             } else if i == selected {
                 Style::default()
@@ -284,18 +286,30 @@ pub fn draw_artifact_view(frame: &mut Frame, title: &str, content: &str, scroll:
     frame.render_widget(paragraph, area);
 }
 
+pub struct ConfigScreenParams<'a> {
+    pub command: &'a str,
+    pub prompt: &'a str,
+    pub post_implementation_prompt: &'a str,
+    pub interactive_command: &'a str,
+    pub run_finished_command: &'a str,
+    pub cursor_position: usize,
+    pub focused_field: &'a ConfigField,
+    pub editing: bool,
+}
+
 pub fn draw_config_screen(
     frame: &mut Frame,
-    command: &str,
-    prompt: &str,
-    post_implementation_prompt: &str,
-    interactive_command: &str,
-    run_finished_command: &str,
-    cursor_position: usize,
-    focused_field: &ConfigField,
-    editing: bool,
+    params: &ConfigScreenParams,
     area: Rect,
 ) {
+    let command = params.command;
+    let prompt = params.prompt;
+    let post_implementation_prompt = params.post_implementation_prompt;
+    let interactive_command = params.interactive_command;
+    let run_finished_command = params.run_finished_command;
+    let cursor_position = params.cursor_position;
+    let focused_field = params.focused_field;
+    let editing = params.editing;
     let chunks = Layout::vertical([
         Constraint::Length(3), // Command field
         Constraint::Min(3),   // Prompt preview
@@ -1365,7 +1379,11 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                draw_config_screen(frame, command, prompt, "", "claude", "", cursor_position, focused_field, editing, area);
+                draw_config_screen(frame, &ConfigScreenParams {
+                    command, prompt, post_implementation_prompt: "",
+                    interactive_command: "claude", run_finished_command: "",
+                    cursor_position, focused_field, editing,
+                }, area);
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -1465,7 +1483,11 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                draw_config_screen(frame, "cmd {prompt}", "prompt", "", "claude", "", 0, &ConfigField::Command, false, area);
+                draw_config_screen(frame, &ConfigScreenParams {
+                    command: "cmd {prompt}", prompt: "prompt", post_implementation_prompt: "",
+                    interactive_command: "claude", run_finished_command: "",
+                    cursor_position: 0, focused_field: &ConfigField::Command, editing: false,
+                }, area);
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -1487,7 +1509,11 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                draw_config_screen(frame, "cmd {prompt}", "prompt", "", "claude", "", 0, &ConfigField::Command, true, area);
+                draw_config_screen(frame, &ConfigScreenParams {
+                    command: "cmd {prompt}", prompt: "prompt", post_implementation_prompt: "",
+                    interactive_command: "claude", run_finished_command: "",
+                    cursor_position: 0, focused_field: &ConfigField::Command, editing: true,
+                }, area);
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -1548,7 +1574,11 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                draw_config_screen(frame, "cmd {prompt}", "prompt", "commit changes", "claude", "", 0, &ConfigField::Command, false, area);
+                draw_config_screen(frame, &ConfigScreenParams {
+                    command: "cmd {prompt}", prompt: "prompt", post_implementation_prompt: "commit changes",
+                    interactive_command: "claude", run_finished_command: "",
+                    cursor_position: 0, focused_field: &ConfigField::Command, editing: false,
+                }, area);
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -1572,7 +1602,11 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                draw_config_screen(frame, "cmd {prompt}", "prompt", "", "claude", "", 0, &ConfigField::Command, false, area);
+                draw_config_screen(frame, &ConfigScreenParams {
+                    command: "cmd {prompt}", prompt: "prompt", post_implementation_prompt: "",
+                    interactive_command: "claude", run_finished_command: "",
+                    cursor_position: 0, focused_field: &ConfigField::Command, editing: false,
+                }, area);
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -1595,7 +1629,11 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                draw_config_screen(frame, "cmd {prompt}", "prompt", "", "claude", "", 0, &ConfigField::PostImplementationPrompt, false, area);
+                draw_config_screen(frame, &ConfigScreenParams {
+                    command: "cmd {prompt}", prompt: "prompt", post_implementation_prompt: "",
+                    interactive_command: "claude", run_finished_command: "",
+                    cursor_position: 0, focused_field: &ConfigField::PostImplementationPrompt, editing: false,
+                }, area);
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -1755,13 +1793,13 @@ mod tests {
                 name: "add-api".to_string(),
                 completed_tasks: 2,
                 total_tasks: 5,
-                status: "in-progress".to_string(),
+
             },
             crate::data::ChangeEntry {
                 name: "add-auth".to_string(),
                 completed_tasks: 0,
                 total_tasks: 7,
-                status: "in-progress".to_string(),
+
             },
         ];
         let mut deps = HashMap::new();
@@ -1789,7 +1827,7 @@ mod tests {
             name: "simple-change".to_string(),
             completed_tasks: 1,
             total_tasks: 3,
-            status: "in-progress".to_string(),
+
         }];
         let deps = HashMap::new();
         let rendered = render_change_list_with_deps(
@@ -1812,7 +1850,7 @@ mod tests {
             name: "my-change".to_string(),
             completed_tasks: 0,
             total_tasks: 1,
-            status: "in-progress".to_string(),
+
         }];
         let mut deps = HashMap::new();
         deps.insert(
@@ -2039,7 +2077,11 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                draw_config_screen(frame, "cmd {prompt}", "prompt", "", "aider --model gpt4", "", 0, &ConfigField::Command, false, area);
+                draw_config_screen(frame, &ConfigScreenParams {
+                    command: "cmd {prompt}", prompt: "prompt", post_implementation_prompt: "",
+                    interactive_command: "aider --model gpt4", run_finished_command: "",
+                    cursor_position: 0, focused_field: &ConfigField::Command, editing: false,
+                }, area);
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -2064,7 +2106,7 @@ mod tests {
                     name: "test-change".to_string(),
                     completed_tasks: 1,
                     total_tasks: 3,
-                    status: "in-progress".to_string(),
+    
                 }],
                 selected: 0,
                 error: None,
