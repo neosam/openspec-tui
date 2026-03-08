@@ -3,6 +3,8 @@ name = "openspec-tui"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+description = "A terminal UI for browsing and implementing OpenSpec changes"
+repository = "https://github.com/neosam/openspec-tui"
 
 [dependencies]
 ratatui = "0.30"
