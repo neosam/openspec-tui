@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
@@ -6,14 +8,14 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
 };
 
-use crate::runner::ImplState;
+use crate::runner::{BatchImplState, ImplState};
 
 use crate::app::{App, ChangeTab, ConfigField, Screen};
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let (content_area, status_area) = if let Some(ref impl_state) = app.implementation {
         let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(4)]).split(frame.area());
-        draw_status_bar(frame, impl_state, chunks[1]);
+        draw_status_bar(frame, impl_state, app.batch.as_ref(), chunks[1]);
         (chunks[0], Some(chunks[1]))
     } else {
         (frame.area(), None)
@@ -26,7 +28,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
             selected,
             error,
             tab,
-        } => draw_change_list(frame, changes, *selected, error.as_deref(), tab, content_area),
+            change_deps,
+        } => draw_change_list(frame, changes, *selected, error.as_deref(), tab, change_deps, content_area),
         Screen::ArtifactMenu {
             change_name,
             items,
@@ -46,6 +49,27 @@ pub fn draw(frame: &mut Frame, app: &App) {
             focused_field,
             editing,
         } => draw_config_screen(frame, command, prompt, *cursor_position, focused_field, *editing, content_area),
+        Screen::DependencyView {
+            change_name,
+            dependencies,
+            selected,
+            ..
+        } => draw_dependency_view(frame, change_name, dependencies, *selected, content_area),
+        Screen::DependencyAdd {
+            change_name,
+            available_changes,
+            selected,
+            ..
+        } => draw_dependency_add(frame, change_name, available_changes, *selected, content_area),
+        Screen::DependencyGraph {
+            graph_text,
+            scroll,
+        } => draw_dependency_graph(frame, graph_text, *scroll, content_area),
+        Screen::RunAllSelection {
+            entries,
+            selected,
+            error,
+        } => draw_run_all_selection(frame, entries, *selected, error.as_deref(), content_area),
     }
 }
 
@@ -80,6 +104,7 @@ fn draw_change_list(
     selected: usize,
     error: Option<&str>,
     tab: &ChangeTab,
+    change_deps: &HashMap<String, Vec<String>>,
     area: Rect,
 ) {
     if let Some(err) = error {
@@ -112,6 +137,9 @@ fn draw_change_list(
         return;
     }
 
+    // Available width inside the border (2 chars for borders)
+    let inner_width = area.width.saturating_sub(2) as usize;
+
     let items: Vec<ListItem> = changes
         .iter()
         .enumerate()
@@ -123,14 +151,39 @@ fn draw_change_list(
             } else {
                 Style::default()
             };
-            let line = Line::from(vec![
+            let progress = format!("  ({}/{})", change.completed_tasks, change.total_tasks);
+            let left_len = change.name.len() + progress.len();
+
+            let mut spans = vec![
                 Span::styled(&change.name, style),
                 Span::styled(
-                    format!("  ({}/{})", change.completed_tasks, change.total_tasks),
+                    progress,
                     Style::default().fg(Color::DarkGray),
                 ),
-            ]);
-            ListItem::new(line)
+            ];
+
+            if let Some(deps) = change_deps.get(&change.name) {
+                if !deps.is_empty() {
+                    let dep_str = format!("<- {}", deps.join(", "));
+                    // Need at least 3 chars of space before dep string (for "   ")
+                    let available = inner_width.saturating_sub(left_len + 3);
+                    let truncated = if dep_str.len() > available && available > 3 {
+                        format!("{}...", &dep_str[..available - 3])
+                    } else if dep_str.len() > available {
+                        String::new()
+                    } else {
+                        dep_str
+                    };
+                    if !truncated.is_empty() {
+                        spans.push(Span::styled(
+                            format!("   {}", truncated),
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                    }
+                }
+            }
+
+            ListItem::new(Line::from(spans))
         })
         .collect();
 
@@ -329,7 +382,105 @@ pub fn draw_config_screen(
     frame.render_widget(hints_paragraph, chunks[2]);
 }
 
-pub fn draw_status_bar(frame: &mut Frame, impl_state: &ImplState, area: Rect) {
+pub fn draw_dependency_view(
+    frame: &mut Frame,
+    change_name: &str,
+    dependencies: &[String],
+    selected: usize,
+    area: Rect,
+) {
+    if dependencies.is_empty() {
+        let paragraph = Paragraph::new("No dependencies configured.")
+            .style(Style::default().fg(Color::DarkGray))
+            .block(
+                Block::default()
+                    .title(format!(" {} - Dependencies ", change_name))
+                    .title_bottom(Line::from(vec![
+                        Span::styled(" [A] Add ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("[Esc] Back ", Style::default().fg(Color::DarkGray)),
+                    ]))
+                    .borders(Borders::ALL),
+            );
+        frame.render_widget(paragraph, area);
+        return;
+    }
+
+    let items: Vec<ListItem> = dependencies
+        .iter()
+        .enumerate()
+        .map(|(i, dep)| {
+            let style = if i == selected {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            let indicator = if i == selected { "> " } else { "  " };
+            ListItem::new(Line::from(Span::styled(
+                format!("{}{}", indicator, dep),
+                style,
+            )))
+        })
+        .collect();
+
+    let list = List::new(items).block(
+        Block::default()
+            .title(format!(" {} - Dependencies ", change_name))
+            .title_bottom(Line::from(vec![
+                Span::styled(" [A] Add ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[D] Remove ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[Esc] Back ", Style::default().fg(Color::DarkGray)),
+            ]))
+            .borders(Borders::ALL),
+    );
+    frame.render_widget(list, area);
+}
+
+pub fn draw_dependency_add(
+    frame: &mut Frame,
+    change_name: &str,
+    available_changes: &[String],
+    selected: usize,
+    area: Rect,
+) {
+    let items: Vec<ListItem> = available_changes
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let style = if i == selected {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            let indicator = if i == selected { "> " } else { "  " };
+            ListItem::new(Line::from(Span::styled(
+                format!("{}{}", indicator, name),
+                style,
+            )))
+        })
+        .collect();
+
+    let list = List::new(items).block(
+        Block::default()
+            .title(format!(" {} - Add Dependency ", change_name))
+            .title_bottom(Line::from(vec![
+                Span::styled(" [Enter] Select ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[Esc] Cancel ", Style::default().fg(Color::DarkGray)),
+            ]))
+            .borders(Borders::ALL),
+    );
+    frame.render_widget(list, area);
+}
+
+pub fn draw_status_bar(
+    frame: &mut Frame,
+    impl_state: &ImplState,
+    batch: Option<&BatchImplState>,
+    area: Rect,
+) {
     let progress_pct = if impl_state.total > 0 {
         (impl_state.completed as f64 / impl_state.total as f64 * 100.0) as u16
     } else {
@@ -337,9 +488,35 @@ pub fn draw_status_bar(frame: &mut Frame, impl_state: &ImplState, area: Rect) {
     };
 
     // Build progress bar: use the available inner width minus the text portions
-    // Line 1: ⟳ change-name  completed/total  [████░░] pct%
+    // Line 1: ⟳ change-name  completed/total  [████░░] pct%  Change X/Y  (batch info)
     // Line 2: Log: /path/to/log  [S] Stop
     let bar_width = area.width.saturating_sub(2) as usize; // account for borders
+
+    // Build batch suffix for line 1 (e.g., "  Change 2/4  1 failed, 2 skipped")
+    let batch_suffix = if let Some(batch) = batch {
+        let change_progress = format!(
+            "  Change {}/{}",
+            batch.current_index + 1,
+            batch.total()
+        );
+        let mut parts = Vec::new();
+        let failed_count = batch.failed.len();
+        let skipped_count = batch.skipped.len();
+        if failed_count > 0 {
+            parts.push(format!("{} failed", failed_count));
+        }
+        if skipped_count > 0 {
+            parts.push(format!("{} skipped", skipped_count));
+        }
+        if parts.is_empty() {
+            change_progress
+        } else {
+            format!("{}  {}", change_progress, parts.join(", "))
+        }
+    } else {
+        String::new()
+    };
+
     let prefix = format!(
         " ⟳ {}  {}/{}  ",
         impl_state.change_name, impl_state.completed, impl_state.total
@@ -347,7 +524,8 @@ pub fn draw_status_bar(frame: &mut Frame, impl_state: &ImplState, area: Rect) {
     let suffix = format!(" {}%", progress_pct);
     let bar_space = bar_width
         .saturating_sub(prefix.len())
-        .saturating_sub(suffix.len());
+        .saturating_sub(suffix.len())
+        .saturating_sub(batch_suffix.len());
     let filled = if impl_state.total > 0 {
         (bar_space as u32 * impl_state.completed / impl_state.total) as usize
     } else {
@@ -355,12 +533,19 @@ pub fn draw_status_bar(frame: &mut Frame, impl_state: &ImplState, area: Rect) {
     };
     let empty = bar_space.saturating_sub(filled);
 
-    let line1 = Line::from(vec![
+    let mut line1_spans = vec![
         Span::styled(&prefix, Style::default().fg(Color::Cyan)),
         Span::styled("█".repeat(filled), Style::default().fg(Color::Green)),
         Span::styled("░".repeat(empty), Style::default().fg(Color::DarkGray)),
         Span::styled(&suffix, Style::default().fg(Color::Cyan)),
-    ]);
+    ];
+    if !batch_suffix.is_empty() {
+        line1_spans.push(Span::styled(
+            batch_suffix,
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    let line1 = Line::from(line1_spans);
 
     let log_display = impl_state.log_path.display().to_string();
     let line2 = Line::from(vec![
@@ -377,6 +562,114 @@ pub fn draw_status_bar(frame: &mut Frame, impl_state: &ImplState, area: Rect) {
             .border_style(Style::default().fg(Color::DarkGray)),
     );
     frame.render_widget(paragraph, area);
+}
+
+pub fn draw_dependency_graph(frame: &mut Frame, graph_text: &str, scroll: usize, area: Rect) {
+    let total_lines = graph_text.lines().count();
+
+    let paragraph = Paragraph::new(graph_text)
+        .scroll((scroll as u16, 0))
+        .block(
+            Block::default()
+                .title(format!(
+                    " Dependency Graph [{}/{}] ",
+                    scroll + 1,
+                    total_lines.max(1)
+                ))
+                .title_bottom(Line::from(vec![
+                    Span::styled(" [Esc] Back ", Style::default().fg(Color::DarkGray)),
+                ]))
+                .borders(Borders::ALL),
+        );
+    frame.render_widget(paragraph, area);
+}
+
+pub fn draw_run_all_selection(
+    frame: &mut Frame,
+    entries: &[crate::app::RunAllEntry],
+    selected: usize,
+    error: Option<&str>,
+    area: Rect,
+) {
+    if entries.is_empty() {
+        let paragraph = Paragraph::new("No eligible changes found (no tasks.md).")
+            .style(Style::default().fg(Color::DarkGray))
+            .block(
+                Block::default()
+                    .title(" Run All - Select Changes ")
+                    .title_bottom(Line::from(vec![
+                        Span::styled(" [Esc] Cancel ", Style::default().fg(Color::DarkGray)),
+                    ]))
+                    .borders(Borders::ALL),
+            );
+        frame.render_widget(paragraph, area);
+        return;
+    }
+
+    let items: Vec<ListItem> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            let checkbox = if entry.blocked {
+                "[~]"
+            } else if entry.included {
+                "[x]"
+            } else {
+                "[ ]"
+            };
+
+            let progress = format!("({}/{})", entry.completed_tasks, entry.total_tasks);
+
+            let style = if entry.blocked {
+                Style::default().fg(Color::DarkGray)
+            } else if i == selected {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+
+            let mut spans = vec![
+                Span::styled(format!(" {} ", checkbox), style),
+                Span::styled(&entry.change_name, style),
+                Span::styled(
+                    format!("  {}", progress),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ];
+
+            if let Some(ref blocker) = entry.blocked_by {
+                spans.push(Span::styled(
+                    format!("  blocked by: {}", blocker),
+                    Style::default().fg(Color::Red),
+                ));
+            }
+
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+
+    let mut title_bottom_spans = vec![
+        Span::styled(" [Space] Toggle ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[Enter] Start ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[Esc] Cancel ", Style::default().fg(Color::DarkGray)),
+    ];
+
+    if let Some(err) = error {
+        title_bottom_spans.push(Span::styled(
+            format!(" {} ", err),
+            Style::default().fg(Color::Red),
+        ));
+    }
+
+    let list = List::new(items).block(
+        Block::default()
+            .title(" Run All - Select Changes ")
+            .title_bottom(Line::from(title_bottom_spans))
+            .borders(Borders::ALL),
+    );
+    frame.render_widget(list, area);
 }
 
 #[cfg(test)]
@@ -513,12 +806,21 @@ mod tests {
     }
 
     fn render_status_bar(width: u16, height: u16, impl_state: &ImplState) -> String {
+        render_status_bar_with_batch(width, height, impl_state, None)
+    }
+
+    fn render_status_bar_with_batch(
+        width: u16,
+        height: u16,
+        impl_state: &ImplState,
+        batch: Option<&BatchImplState>,
+    ) -> String {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
                 let area = Rect::new(0, 0, width, height);
-                draw_status_bar(frame, impl_state, area);
+                draw_status_bar(frame, impl_state, batch, area);
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -611,6 +913,104 @@ mod tests {
         assert!(rendered.contains("100%"), "100% should be displayed");
     }
 
+    #[test]
+    fn test_status_bar_batch_progress() {
+        let state = make_impl_state("change-b", 3, 7);
+        let batch = BatchImplState::new(
+            vec![
+                "change-a".to_string(),
+                "change-b".to_string(),
+                "change-c".to_string(),
+                "change-d".to_string(),
+            ],
+            std::collections::HashMap::new(),
+        );
+        // current_index=0 means we're on change 1/4, but we want to simulate being on change 2
+        let mut batch = batch;
+        batch.current_index = 1;
+        batch.completed.insert("change-a".to_string());
+
+        let rendered = render_status_bar_with_batch(100, 4, &state, Some(&batch));
+        assert!(
+            rendered.contains("3/7"),
+            "Task progress should be displayed"
+        );
+        assert!(
+            rendered.contains("Change 2/4"),
+            "Batch change progress should be displayed"
+        );
+    }
+
+    #[test]
+    fn test_status_bar_batch_with_failures() {
+        let state = make_impl_state("change-c", 1, 5);
+        let mut batch = BatchImplState::new(
+            vec![
+                "change-a".to_string(),
+                "change-b".to_string(),
+                "change-c".to_string(),
+            ],
+            std::collections::HashMap::new(),
+        );
+        batch.current_index = 2;
+        batch.failed.insert("change-a".to_string());
+        batch.completed.insert("change-b".to_string());
+
+        let rendered = render_status_bar_with_batch(100, 4, &state, Some(&batch));
+        assert!(
+            rendered.contains("Change 3/3"),
+            "Batch change progress should be displayed"
+        );
+        assert!(
+            rendered.contains("1 failed"),
+            "Failed count should be displayed"
+        );
+    }
+
+    #[test]
+    fn test_status_bar_batch_with_skips() {
+        let state = make_impl_state("change-d", 0, 3);
+        let mut batch = BatchImplState::new(
+            vec![
+                "change-a".to_string(),
+                "change-b".to_string(),
+                "change-c".to_string(),
+                "change-d".to_string(),
+            ],
+            std::collections::HashMap::new(),
+        );
+        batch.current_index = 3;
+        batch.failed.insert("change-a".to_string());
+        batch.skipped.insert("change-b".to_string());
+        batch.skipped.insert("change-c".to_string());
+
+        let rendered = render_status_bar_with_batch(100, 4, &state, Some(&batch));
+        assert!(
+            rendered.contains("Change 4/4"),
+            "Batch change progress should be displayed"
+        );
+        assert!(
+            rendered.contains("1 failed"),
+            "Failed count should be displayed"
+        );
+        assert!(
+            rendered.contains("2 skipped"),
+            "Skipped count should be displayed"
+        );
+    }
+
+    #[test]
+    fn test_status_bar_no_batch_unchanged() {
+        // Without batch state, the status bar should not show any batch info
+        let state = make_impl_state("test", 3, 7);
+        let rendered = render_status_bar_with_batch(80, 4, &state, None);
+        assert!(rendered.contains("3/7"), "Task progress should be displayed");
+        assert!(
+            !rendered.contains("Change"),
+            "No batch progress should be displayed without batch state"
+        );
+    }
+
     fn render_draw(width: u16, height: u16, app: &crate::app::App) -> String {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -639,10 +1039,12 @@ mod tests {
                 selected: 0,
                 error: None,
                 tab: crate::app::ChangeTab::Active,
+                change_deps: std::collections::HashMap::new(),
             },
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: Some(make_impl_state("my-change", 2, 5)),
+            batch: None,
             config: crate::config::TuiConfig::default(),
         };
 
@@ -666,10 +1068,12 @@ mod tests {
                 selected: 0,
                 error: None,
                 tab: crate::app::ChangeTab::Active,
+                change_deps: std::collections::HashMap::new(),
             },
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            batch: None,
             config: crate::config::TuiConfig::default(),
         };
 
@@ -687,6 +1091,17 @@ mod tests {
     }
 
     fn render_change_list(width: u16, height: u16, tab: &crate::app::ChangeTab) -> String {
+        let empty_deps = HashMap::new();
+        render_change_list_with_deps(width, height, &[], tab, &empty_deps)
+    }
+
+    fn render_change_list_with_deps(
+        width: u16,
+        height: u16,
+        changes: &[crate::data::ChangeEntry],
+        tab: &crate::app::ChangeTab,
+        deps: &HashMap<String, Vec<String>>,
+    ) -> String {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
@@ -694,10 +1109,11 @@ mod tests {
                 let area = frame.area();
                 draw_change_list(
                     frame,
-                    &[],
+                    changes,
                     0,
                     None,
                     tab,
+                    deps,
                     area,
                 );
             })
@@ -899,6 +1315,7 @@ mod tests {
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            batch: None,
             config: crate::config::TuiConfig::default(),
         };
         let rendered = render_draw(60, 15, &app);
@@ -988,5 +1405,424 @@ mod tests {
             100, 15, "cmd --flag", "prompt", 0, &ConfigField::Command, true,
         );
         assert!(rendered_edit.contains("missing"), "Warning should show in edit mode");
+    }
+
+    // --- Dependency View Rendering Tests ---
+
+    fn render_dependency_view(width: u16, height: u16, deps: &[String], selected: usize) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_dependency_view(frame, "test-change", deps, selected, area);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut lines = Vec::new();
+        for y in 0..height {
+            let mut line = String::new();
+            for x in 0..width {
+                line.push_str(buffer.cell((x, y)).unwrap().symbol());
+            }
+            lines.push(line.trim_end().to_string());
+        }
+        lines.join("\n")
+    }
+
+    #[test]
+    fn test_dependency_view_shows_title() {
+        let deps = vec!["dep-a".to_string()];
+        let rendered = render_dependency_view(50, 6, &deps, 0);
+        assert!(rendered.contains("test-change"), "Change name should be in title");
+        assert!(rendered.contains("Dependencies"), "Dependencies label should be in title");
+    }
+
+    #[test]
+    fn test_dependency_view_shows_dependencies() {
+        let deps = vec!["dep-a".to_string(), "dep-b".to_string()];
+        let rendered = render_dependency_view(50, 6, &deps, 0);
+        assert!(rendered.contains("dep-a"), "First dependency should be visible");
+        assert!(rendered.contains("dep-b"), "Second dependency should be visible");
+    }
+
+    #[test]
+    fn test_dependency_view_shows_empty_message() {
+        let deps: Vec<String> = vec![];
+        let rendered = render_dependency_view(50, 6, &deps, 0);
+        assert!(rendered.contains("No dependencies"), "Empty message should show");
+    }
+
+    #[test]
+    fn test_dependency_view_shows_keybinding_hints() {
+        let deps = vec!["dep-a".to_string()];
+        let rendered = render_dependency_view(60, 6, &deps, 0);
+        assert!(rendered.contains("[A] Add"), "Add hint should be visible");
+        assert!(rendered.contains("[D] Remove"), "Remove hint should be visible");
+        assert!(rendered.contains("[Esc] Back"), "Back hint should be visible");
+    }
+
+    #[test]
+    fn test_dependency_view_selection_highlight() {
+        let deps = vec!["dep-a".to_string(), "dep-b".to_string()];
+        let backend = TestBackend::new(50, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_dependency_view(frame, "test-change", &deps, 1, area);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        // Find "dep-b" in the buffer and check it has yellow foreground (selected)
+        let mut found_yellow = false;
+        for y in 0..6u16 {
+            for x in 0..50u16 {
+                let cell = buffer.cell((x, y)).unwrap();
+                if cell.symbol() == "d" && x + 4 < 50 {
+                    let next = buffer.cell((x + 1, y)).unwrap();
+                    if next.symbol() == "e" {
+                        let third = buffer.cell((x + 2, y)).unwrap();
+                        let fourth = buffer.cell((x + 3, y)).unwrap();
+                        if third.symbol() == "p" && fourth.symbol() == "-" {
+                            let fifth = buffer.cell((x + 4, y)).unwrap();
+                            if fifth.symbol() == "b" && cell.fg == Color::Yellow {
+                                found_yellow = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(found_yellow, "Selected dependency should be highlighted in yellow");
+    }
+
+    fn render_dependency_add(width: u16, height: u16, changes: &[String], selected: usize) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_dependency_add(frame, "test-change", changes, selected, area);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut lines = Vec::new();
+        for y in 0..height {
+            let mut line = String::new();
+            for x in 0..width {
+                line.push_str(buffer.cell((x, y)).unwrap().symbol());
+            }
+            lines.push(line.trim_end().to_string());
+        }
+        lines.join("\n")
+    }
+
+    #[test]
+    fn test_dependency_add_shows_title() {
+        let changes = vec!["change-a".to_string()];
+        let rendered = render_dependency_add(50, 6, &changes, 0);
+        assert!(rendered.contains("Add Dependency"), "Add Dependency should be in title");
+    }
+
+    #[test]
+    fn test_dependency_add_shows_available_changes() {
+        let changes = vec!["change-a".to_string(), "change-b".to_string()];
+        let rendered = render_dependency_add(50, 6, &changes, 0);
+        assert!(rendered.contains("change-a"), "First change should be visible");
+        assert!(rendered.contains("change-b"), "Second change should be visible");
+    }
+
+    #[test]
+    fn test_dependency_add_shows_keybinding_hints() {
+        let changes = vec!["change-a".to_string()];
+        let rendered = render_dependency_add(60, 6, &changes, 0);
+        assert!(rendered.contains("[Enter] Select"), "Select hint should be visible");
+        assert!(rendered.contains("[Esc] Cancel"), "Cancel hint should be visible");
+    }
+
+    #[test]
+    fn test_change_list_shows_inline_dependencies() {
+        let changes = vec![
+            crate::data::ChangeEntry {
+                name: "add-api".to_string(),
+                completed_tasks: 2,
+                total_tasks: 5,
+                status: "in-progress".to_string(),
+            },
+            crate::data::ChangeEntry {
+                name: "add-auth".to_string(),
+                completed_tasks: 0,
+                total_tasks: 7,
+                status: "in-progress".to_string(),
+            },
+        ];
+        let mut deps = HashMap::new();
+        deps.insert(
+            "add-auth".to_string(),
+            vec!["add-api".to_string(), "add-user".to_string()],
+        );
+        let rendered = render_change_list_with_deps(
+            80,
+            6,
+            &changes,
+            &crate::app::ChangeTab::Active,
+            &deps,
+        );
+        assert!(
+            rendered.contains("<- add-api, add-user"),
+            "Dependencies should be displayed inline: {}",
+            rendered,
+        );
+    }
+
+    #[test]
+    fn test_change_list_no_deps_no_arrow() {
+        let changes = vec![crate::data::ChangeEntry {
+            name: "simple-change".to_string(),
+            completed_tasks: 1,
+            total_tasks: 3,
+            status: "in-progress".to_string(),
+        }];
+        let deps = HashMap::new();
+        let rendered = render_change_list_with_deps(
+            60,
+            5,
+            &changes,
+            &crate::app::ChangeTab::Active,
+            &deps,
+        );
+        assert!(
+            !rendered.contains("<-"),
+            "No dependency arrow should appear for changes without deps: {}",
+            rendered,
+        );
+    }
+
+    #[test]
+    fn test_change_list_deps_truncated_when_long() {
+        let changes = vec![crate::data::ChangeEntry {
+            name: "my-change".to_string(),
+            completed_tasks: 0,
+            total_tasks: 1,
+            status: "in-progress".to_string(),
+        }];
+        let mut deps = HashMap::new();
+        deps.insert(
+            "my-change".to_string(),
+            vec![
+                "very-long-dependency-name-one".to_string(),
+                "very-long-dependency-name-two".to_string(),
+                "very-long-dependency-name-three".to_string(),
+            ],
+        );
+        // Use a narrow width to force truncation
+        let rendered = render_change_list_with_deps(
+            50,
+            5,
+            &changes,
+            &crate::app::ChangeTab::Active,
+            &deps,
+        );
+        // Should either show truncated "..." or not show deps at all if no space
+        let has_ellipsis = rendered.contains("...");
+        let has_no_arrow = !rendered.contains("<-");
+        assert!(
+            has_ellipsis || has_no_arrow,
+            "Long deps should be truncated with ... or omitted: {}",
+            rendered,
+        );
+    }
+
+    fn render_dependency_graph(width: u16, height: u16, graph_text: &str, scroll: usize) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_dependency_graph(frame, graph_text, scroll, area);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut lines = Vec::new();
+        for y in 0..height {
+            let mut line = String::new();
+            for x in 0..width {
+                line.push_str(buffer.cell((x, y)).unwrap().symbol());
+            }
+            lines.push(line.trim_end().to_string());
+        }
+        lines.join("\n")
+    }
+
+    #[test]
+    fn test_draw_dependency_graph_shows_content() {
+        let graph = "root\n├── child-a\n└── child-b";
+        let rendered = render_dependency_graph(40, 8, graph, 0);
+        assert!(rendered.contains("Dependency Graph"), "Should show title");
+        assert!(rendered.contains("root"), "Should show graph content");
+        assert!(rendered.contains("child-a"), "Should show child-a");
+        assert!(rendered.contains("child-b"), "Should show child-b");
+    }
+
+    #[test]
+    fn test_draw_dependency_graph_shows_scroll_position() {
+        let graph = "line1\nline2\nline3";
+        let rendered = render_dependency_graph(40, 6, graph, 1);
+        assert!(rendered.contains("[2/3]"), "Should show scroll position");
+    }
+
+    #[test]
+    fn test_draw_dependency_graph_shows_back_hint() {
+        let graph = "root";
+        let rendered = render_dependency_graph(40, 6, graph, 0);
+        assert!(rendered.contains("[Esc] Back"), "Should show back hint");
+    }
+
+    // --- RunAllSelection rendering tests ---
+
+    fn render_run_all_selection(
+        width: u16,
+        height: u16,
+        entries: &[crate::app::RunAllEntry],
+        selected: usize,
+        error: Option<&str>,
+    ) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_run_all_selection(frame, entries, selected, error, area);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut lines = Vec::new();
+        for y in 0..height {
+            let mut line = String::new();
+            for x in 0..width {
+                line.push_str(buffer.cell((x, y)).unwrap().symbol());
+            }
+            lines.push(line.trim_end().to_string());
+        }
+        lines.join("\n")
+    }
+
+    #[test]
+    fn test_run_all_selection_shows_title() {
+        let entries = vec![crate::app::RunAllEntry {
+            change_name: "test".to_string(),
+            included: true,
+            blocked: false,
+            blocked_by: None,
+            completed_tasks: 1,
+            total_tasks: 3,
+        }];
+        let rendered = render_run_all_selection(60, 6, &entries, 0, None);
+        assert!(
+            rendered.contains("Run All"),
+            "Should show Run All title"
+        );
+    }
+
+    #[test]
+    fn test_run_all_selection_shows_checkboxes() {
+        let entries = vec![
+            crate::app::RunAllEntry {
+                change_name: "included-change".to_string(),
+                included: true,
+                blocked: false,
+                blocked_by: None,
+                completed_tasks: 1,
+                total_tasks: 3,
+            },
+            crate::app::RunAllEntry {
+                change_name: "excluded-change".to_string(),
+                included: false,
+                blocked: false,
+                blocked_by: None,
+                completed_tasks: 0,
+                total_tasks: 5,
+            },
+        ];
+        let rendered = render_run_all_selection(60, 6, &entries, 0, None);
+        assert!(rendered.contains("[x]"), "Should show checked checkbox for included");
+        assert!(rendered.contains("[ ]"), "Should show unchecked checkbox for excluded");
+    }
+
+    #[test]
+    fn test_run_all_selection_shows_blocked() {
+        let entries = vec![crate::app::RunAllEntry {
+            change_name: "blocked-change".to_string(),
+            included: false,
+            blocked: true,
+            blocked_by: Some("some-dep".to_string()),
+            completed_tasks: 0,
+            total_tasks: 5,
+        }];
+        let rendered = render_run_all_selection(80, 6, &entries, 0, None);
+        assert!(rendered.contains("[~]"), "Should show blocked checkbox");
+        assert!(
+            rendered.contains("blocked by"),
+            "Should show blocked reason"
+        );
+    }
+
+    #[test]
+    fn test_run_all_selection_shows_keybinding_hints() {
+        let entries = vec![crate::app::RunAllEntry {
+            change_name: "test".to_string(),
+            included: true,
+            blocked: false,
+            blocked_by: None,
+            completed_tasks: 0,
+            total_tasks: 3,
+        }];
+        let rendered = render_run_all_selection(80, 6, &entries, 0, None);
+        assert!(rendered.contains("[Space] Toggle"), "Should show toggle hint");
+        assert!(rendered.contains("[Enter] Start"), "Should show start hint");
+        assert!(rendered.contains("[Esc] Cancel"), "Should show cancel hint");
+    }
+
+    #[test]
+    fn test_run_all_selection_shows_error() {
+        let entries = vec![crate::app::RunAllEntry {
+            change_name: "test".to_string(),
+            included: false,
+            blocked: false,
+            blocked_by: None,
+            completed_tasks: 0,
+            total_tasks: 3,
+        }];
+        let rendered = render_run_all_selection(80, 6, &entries, 0, Some("No changes selected."));
+        assert!(
+            rendered.contains("No changes selected"),
+            "Should show error message"
+        );
+    }
+
+    #[test]
+    fn test_run_all_selection_shows_progress() {
+        let entries = vec![crate::app::RunAllEntry {
+            change_name: "test".to_string(),
+            included: true,
+            blocked: false,
+            blocked_by: None,
+            completed_tasks: 2,
+            total_tasks: 7,
+        }];
+        let rendered = render_run_all_selection(60, 6, &entries, 0, None);
+        assert!(rendered.contains("(2/7)"), "Should show progress");
+    }
+
+    #[test]
+    fn test_run_all_selection_empty_shows_message() {
+        let entries: Vec<crate::app::RunAllEntry> = vec![];
+        let rendered = render_run_all_selection(60, 6, &entries, 0, None);
+        assert!(
+            rendered.contains("No eligible changes"),
+            "Should show empty message"
+        );
     }
 }

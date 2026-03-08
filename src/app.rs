@@ -1,9 +1,10 @@
 use crossterm::event::KeyCode;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::config::TuiConfig;
 use crate::data::{self, ChangeEntry, ChangeStatusOutput};
-use crate::runner::{self, stop_implementation, ImplState};
+use crate::runner::{self, stop_implementation, BatchImplState, ImplState};
 #[cfg(test)]
 use crate::data::ArtifactStatus;
 
@@ -26,6 +27,7 @@ pub enum Screen {
         selected: usize,
         error: Option<String>,
         tab: ChangeTab,
+        change_deps: HashMap<String, Vec<String>>,
     },
     ArtifactMenu {
         change_name: String,
@@ -47,6 +49,37 @@ pub enum Screen {
         focused_field: ConfigField,
         editing: bool,
     },
+    DependencyView {
+        change_name: String,
+        change_dir: PathBuf,
+        dependencies: Vec<String>,
+        selected: usize,
+    },
+    DependencyAdd {
+        change_name: String,
+        change_dir: PathBuf,
+        available_changes: Vec<String>,
+        selected: usize,
+    },
+    DependencyGraph {
+        graph_text: String,
+        scroll: usize,
+    },
+    RunAllSelection {
+        entries: Vec<RunAllEntry>,
+        selected: usize,
+        error: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct RunAllEntry {
+    pub change_name: String,
+    pub included: bool,
+    pub blocked: bool,
+    pub blocked_by: Option<String>,
+    pub completed_tasks: u32,
+    pub total_tasks: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -55,6 +88,7 @@ pub struct ArtifactMenuItem {
     pub available: bool,
     pub file_path: Option<PathBuf>,
     pub is_spec_header: bool,
+    pub is_dependency_item: bool,
 }
 
 pub struct App {
@@ -62,23 +96,29 @@ pub struct App {
     pub screen_stack: Vec<Screen>,
     pub should_quit: bool,
     pub implementation: Option<ImplState>,
+    pub batch: Option<BatchImplState>,
     pub config: TuiConfig,
 }
 
 impl App {
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let screen = match data::list_changes() {
-            Ok(list) => Screen::ChangeList {
-                changes: list.changes,
-                selected: 0,
-                error: None,
-                tab: ChangeTab::Active,
-            },
+            Ok(list) => {
+                let change_deps = data::load_change_dependencies(&list.changes);
+                Screen::ChangeList {
+                    changes: list.changes,
+                    selected: 0,
+                    error: None,
+                    tab: ChangeTab::Active,
+                    change_deps,
+                }
+            }
             Err(e) => Screen::ChangeList {
                 changes: Vec::new(),
                 selected: 0,
                 error: Some(e),
                 tab: ChangeTab::Active,
+                change_deps: HashMap::new(),
             },
         };
 
@@ -89,6 +129,7 @@ impl App {
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            batch: None,
             config,
         })
     }
@@ -114,6 +155,7 @@ impl App {
         };
         if should_clear {
             self.implementation = None;
+            self.advance_batch();
         }
     }
 
@@ -122,6 +164,41 @@ impl App {
             stop_implementation(state);
             self.implementation = None;
         }
+        self.batch = None;
+    }
+
+    /// Advance the batch after the current implementation finishes.
+    ///
+    /// Determines whether the just-finished change succeeded by reading its
+    /// task progress, then calls `BatchImplState::advance()` to get the next
+    /// change. If there is a next change, starts a new implementation for it.
+    /// If the batch is complete, clears the batch state.
+    pub fn advance_batch(&mut self) {
+        let Some(ref mut batch) = self.batch else {
+            return;
+        };
+
+        // Determine success: all tasks completed in the finished change
+        let success = if let Some(name) = batch.current_change() {
+            let tasks_path = PathBuf::from("openspec/changes")
+                .join(name)
+                .join("tasks.md");
+            match data::parse_task_progress(&tasks_path) {
+                Ok((completed, total)) => total > 0 && completed >= total,
+                Err(_) => false,
+            }
+        } else {
+            false
+        };
+
+        let next = batch.advance(success);
+
+        if let Some(next_name) = next {
+            self.implementation = Some(runner::start_implementation(&next_name, &self.config));
+        } else {
+            // Batch is finished
+            self.batch = None;
+        }
     }
 
     pub fn handle_change_list_input(&mut self, key: KeyCode) {
@@ -129,6 +206,7 @@ impl App {
             changes,
             selected,
             tab,
+            change_deps,
             ..
         } = &mut self.screen
         else {
@@ -158,6 +236,7 @@ impl App {
                             *changes = Vec::new();
                         }
                     }
+                    *change_deps = HashMap::new();
                 }
             }
             KeyCode::Left | KeyCode::Char('h') => {
@@ -167,9 +246,11 @@ impl App {
                     match data::list_changes() {
                         Ok(list) => {
                             *changes = list.changes;
+                            *change_deps = data::load_change_dependencies(changes);
                         }
                         Err(_) => {
                             *changes = Vec::new();
+                            *change_deps = HashMap::new();
                         }
                     }
                 }
@@ -185,6 +266,33 @@ impl App {
             }
             KeyCode::Char('C') => {
                 self.push_config_screen();
+            }
+            KeyCode::Char('G') => {
+                if *tab == ChangeTab::Active {
+                    let graph_text = data::generate_dependency_graph(change_deps);
+                    let old_screen = std::mem::replace(
+                        &mut self.screen,
+                        Screen::DependencyGraph {
+                            graph_text,
+                            scroll: 0,
+                        },
+                    );
+                    self.screen_stack.push(old_screen);
+                }
+            }
+            KeyCode::Char('A') => {
+                if *tab == ChangeTab::Active && self.implementation.is_none() {
+                    let entries = build_run_all_entries(changes);
+                    let old_screen = std::mem::replace(
+                        &mut self.screen,
+                        Screen::RunAllSelection {
+                            entries,
+                            selected: 0,
+                            error: None,
+                        },
+                    );
+                    self.screen_stack.push(old_screen);
+                }
             }
             _ => {}
         }
@@ -202,7 +310,7 @@ impl App {
             }
         };
 
-        let items = build_artifact_menu_items(&status, &change_dir);
+        let items = build_artifact_menu_items(&status, &change_dir, is_archived);
 
         let old_screen = std::mem::replace(
             &mut self.screen,
@@ -260,7 +368,21 @@ impl App {
                 if !item.available || item.is_spec_header {
                     return;
                 }
-                if let Some(path) = &item.file_path {
+                if item.is_dependency_item {
+                    let change_name = change_name.clone();
+                    let change_dir = change_dir.clone();
+                    let dependencies = data::read_dependencies(&change_dir);
+                    let old_screen = std::mem::replace(
+                        &mut self.screen,
+                        Screen::DependencyView {
+                            change_name,
+                            change_dir,
+                            dependencies,
+                            selected: 0,
+                        },
+                    );
+                    self.screen_stack.push(old_screen);
+                } else if let Some(path) = &item.file_path {
                     let title = item.label.clone();
                     let content = data::read_artifact_content(path)
                         .unwrap_or_else(|e| format!("Error reading file: {e}"));
@@ -454,6 +576,132 @@ impl App {
         }
     }
 
+    pub fn handle_dependency_view_input(&mut self, key: KeyCode) {
+        let Screen::DependencyView {
+            change_name,
+            change_dir,
+            dependencies,
+            selected,
+        } = &mut self.screen
+        else {
+            return;
+        };
+
+        match key {
+            KeyCode::Down | KeyCode::Char('j') => {
+                if !dependencies.is_empty() && *selected < dependencies.len() - 1 {
+                    *selected += 1;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if *selected > 0 {
+                    *selected -= 1;
+                }
+            }
+            KeyCode::Char('D') => {
+                if !dependencies.is_empty() {
+                    dependencies.remove(*selected);
+                    let _ = data::write_dependencies(change_dir, dependencies);
+                    if *selected > 0 && *selected >= dependencies.len() {
+                        *selected = dependencies.len().saturating_sub(1);
+                    }
+                }
+            }
+            KeyCode::Char('A') => {
+                let change_name = change_name.clone();
+                let change_dir = change_dir.clone();
+                let deps = dependencies.clone();
+
+                // Get list of active changes, excluding current and already-added
+                let available: Vec<String> = match data::list_changes() {
+                    Ok(list) => list
+                        .changes
+                        .into_iter()
+                        .map(|c| c.name)
+                        .filter(|n| *n != change_name && !deps.contains(n))
+                        .collect(),
+                    Err(_) => Vec::new(),
+                };
+
+                if !available.is_empty() {
+                    let old_screen = std::mem::replace(
+                        &mut self.screen,
+                        Screen::DependencyAdd {
+                            change_name,
+                            change_dir,
+                            available_changes: available,
+                            selected: 0,
+                        },
+                    );
+                    self.screen_stack.push(old_screen);
+                }
+            }
+            KeyCode::Esc => {
+                if let Some(prev) = self.screen_stack.pop() {
+                    self.screen = prev;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn handle_dependency_add_input(&mut self, key: KeyCode) {
+        let Screen::DependencyAdd {
+            change_name: _,
+            change_dir,
+            available_changes,
+            selected,
+        } = &mut self.screen
+        else {
+            return;
+        };
+
+        match key {
+            KeyCode::Down | KeyCode::Char('j') => {
+                if !available_changes.is_empty() && *selected < available_changes.len() - 1 {
+                    *selected += 1;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if *selected > 0 {
+                    *selected -= 1;
+                }
+            }
+            KeyCode::Enter => {
+                if available_changes.is_empty() {
+                    return;
+                }
+                let chosen = available_changes[*selected].clone();
+                let change_dir = change_dir.clone();
+
+                // Pop back to DependencyView and add the dependency
+                if let Some(Screen::DependencyView {
+                    dependencies,
+                    selected: dep_selected,
+                    ..
+                }) = self.screen_stack.last_mut()
+                {
+                    dependencies.push(chosen);
+                    let _ = data::write_dependencies(&change_dir, dependencies);
+                    // Reset selection if it was on the empty placeholder
+                    if dependencies.len() == 1 {
+                        *dep_selected = 0;
+                    }
+                }
+
+                if let Some(prev) = self.screen_stack.pop() {
+                    self.screen = prev;
+                }
+            }
+            KeyCode::Esc => {
+                if let Some(prev) = self.screen_stack.pop() {
+                    self.screen = prev;
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub fn handle_artifact_view_input(&mut self, key: KeyCode) {
         let Screen::ArtifactView {
             scroll, content, ..
@@ -486,11 +734,230 @@ impl App {
             _ => {}
         }
     }
+
+    pub fn handle_dependency_graph_input(&mut self, key: KeyCode) {
+        let Screen::DependencyGraph {
+            scroll,
+            graph_text,
+        } = &mut self.screen
+        else {
+            return;
+        };
+
+        let line_count = graph_text.lines().count();
+
+        match key {
+            KeyCode::Down | KeyCode::Char('j') => {
+                if line_count > 0 && *scroll < line_count.saturating_sub(1) {
+                    *scroll += 1;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if *scroll > 0 {
+                    *scroll -= 1;
+                }
+            }
+            KeyCode::Esc => {
+                if let Some(prev) = self.screen_stack.pop() {
+                    self.screen = prev;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn handle_run_all_selection_input(&mut self, key: KeyCode) {
+        let Screen::RunAllSelection {
+            entries,
+            selected,
+            error,
+        } = &mut self.screen
+        else {
+            return;
+        };
+
+        match key {
+            KeyCode::Down | KeyCode::Char('j') => {
+                if !entries.is_empty() && *selected < entries.len() - 1 {
+                    *selected += 1;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if *selected > 0 {
+                    *selected -= 1;
+                }
+            }
+            KeyCode::Char(' ') => {
+                if !entries.is_empty() {
+                    let entry = &mut entries[*selected];
+                    if !entry.blocked {
+                        entry.included = !entry.included;
+                        // Recalculate blocked state for all entries
+                        recalculate_blocked(entries);
+                    }
+                }
+                *error = None;
+            }
+            KeyCode::Enter => {
+                // Collect included changes and check for cycles
+                let included: Vec<String> = entries
+                    .iter()
+                    .filter(|e| e.included)
+                    .map(|e| e.change_name.clone())
+                    .collect();
+
+                if included.is_empty() {
+                    *error = Some("No changes selected.".to_string());
+                    return;
+                }
+
+                // Build deps map for included changes only
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let changes_dir = cwd.join("openspec").join("changes");
+                let mut deps_map: HashMap<String, Vec<String>> = HashMap::new();
+                let included_set: std::collections::HashSet<&str> =
+                    included.iter().map(|s| s.as_str()).collect();
+                for name in &included {
+                    let change_dir = changes_dir.join(name);
+                    let deps = data::read_dependencies(&change_dir);
+                    // Only include deps that are in the included set
+                    let filtered: Vec<String> = deps
+                        .into_iter()
+                        .filter(|d| included_set.contains(d.as_str()))
+                        .collect();
+                    deps_map.insert(name.clone(), filtered);
+                }
+
+                match data::topological_sort(&deps_map) {
+                    Err(cycle_err) => {
+                        *error = Some(cycle_err);
+                    }
+                    Ok(sorted) => {
+                        if let Some(first) = sorted.first() {
+                            let batch =
+                                BatchImplState::new(sorted.clone(), deps_map);
+                            self.batch = Some(batch);
+                            self.implementation = Some(
+                                runner::start_implementation(first, &self.config),
+                            );
+                        }
+                        if let Some(prev) = self.screen_stack.pop() {
+                            self.screen = prev;
+                        }
+                    }
+                }
+            }
+            KeyCode::Esc => {
+                if let Some(prev) = self.screen_stack.pop() {
+                    self.screen = prev;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Build the list of entries for the RunAllSelection screen.
+///
+/// Filters changes to those with a `tasks.md`, reads dependencies,
+/// and determines which entries are blocked due to excluded dependencies.
+pub fn build_run_all_entries(changes: &[data::ChangeEntry]) -> Vec<RunAllEntry> {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let changes_dir = cwd.join("openspec").join("changes");
+    let archive_dir = cwd.join("openspec").join("changes").join("archive");
+    let archived = data::resolve_archived_dependencies(&archive_dir);
+
+    let mut entries: Vec<RunAllEntry> = changes
+        .iter()
+        .filter(|c| {
+            let dir = changes_dir.join(&c.name);
+            data::has_tasks_file(&dir)
+        })
+        .map(|c| RunAllEntry {
+            change_name: c.name.clone(),
+            included: true,
+            blocked: false,
+            blocked_by: None,
+            completed_tasks: c.completed_tasks,
+            total_tasks: c.total_tasks,
+        })
+        .collect();
+
+    // Determine blocked state based on dependencies
+    // A change is blocked if any of its dependencies is not included
+    // and not fulfilled (completed or archived)
+    let change_names: std::collections::HashSet<String> =
+        entries.iter().map(|e| e.change_name.clone()).collect();
+
+    for i in 0..entries.len() {
+        let dir = changes_dir.join(&entries[i].change_name);
+        let deps = data::read_dependencies(&dir);
+        for dep in &deps {
+            let in_list = change_names.contains(dep);
+            let is_archived = archived.contains(dep);
+            if !in_list && !is_archived {
+                entries[i].blocked = true;
+                entries[i].blocked_by = Some(dep.clone());
+                entries[i].included = false;
+                break;
+            }
+        }
+    }
+
+    entries
+}
+
+/// Recalculate blocked state after a toggle.
+///
+/// A change becomes blocked if any of its dependencies is excluded
+/// (not included) in the current selection.
+fn recalculate_blocked(entries: &mut [RunAllEntry]) {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let changes_dir = cwd.join("openspec").join("changes");
+    let archive_dir = cwd.join("openspec").join("changes").join("archive");
+    let archived = data::resolve_archived_dependencies(&archive_dir);
+
+    // Build sets from current state before mutating
+    let included: std::collections::HashSet<String> = entries
+        .iter()
+        .filter(|e| e.included)
+        .map(|e| e.change_name.clone())
+        .collect();
+
+    let all_entry_names: std::collections::HashSet<String> =
+        entries.iter().map(|e| e.change_name.clone()).collect();
+
+    // Compute new blocked state per entry
+    let updates: Vec<(bool, Option<String>)> = entries
+        .iter()
+        .map(|entry| {
+            let dir = changes_dir.join(&entry.change_name);
+            let deps = data::read_dependencies(&dir);
+            for dep in &deps {
+                let is_included = included.contains(dep);
+                let is_archived = archived.contains(dep);
+                if !is_included && !is_archived && all_entry_names.contains(dep) {
+                    return (true, Some(dep.clone()));
+                }
+            }
+            (false, None)
+        })
+        .collect();
+
+    // Apply updates
+    for (i, (blocked, blocked_by)) in updates.into_iter().enumerate() {
+        if blocked && entries[i].included {
+            entries[i].included = false;
+        }
+        entries[i].blocked = blocked;
+        entries[i].blocked_by = blocked_by;
+    }
 }
 
 pub fn build_artifact_menu_items(
     status: &ChangeStatusOutput,
     change_dir: &PathBuf,
+    is_archived: bool,
 ) -> Vec<ArtifactMenuItem> {
     let mut items = Vec::new();
 
@@ -514,6 +981,7 @@ pub fn build_artifact_menu_items(
             available,
             file_path,
             is_spec_header: false,
+            is_dependency_item: false,
         });
     }
 
@@ -531,6 +999,7 @@ pub fn build_artifact_menu_items(
         available: specs_available,
         file_path: None,
         is_spec_header: true,
+        is_dependency_item: false,
     });
 
     for spec in &spec_items {
@@ -539,6 +1008,7 @@ pub fn build_artifact_menu_items(
             available: true,
             file_path: Some(spec.path.clone()),
             is_spec_header: false,
+            is_dependency_item: false,
         });
     }
 
@@ -550,6 +1020,19 @@ pub fn build_artifact_menu_items(
             available: true,
             file_path: Some(log_path),
             is_spec_header: false,
+            is_dependency_item: false,
+        });
+    }
+
+    // Add Dependencies item for active changes
+    if !is_archived {
+        let dep_count = data::read_dependencies(change_dir).len();
+        items.push(ArtifactMenuItem {
+            label: format!("Dependencies [{}]", dep_count),
+            available: true,
+            file_path: None,
+            is_spec_header: false,
+            is_dependency_item: true,
         });
     }
 
@@ -588,10 +1071,12 @@ mod tests {
                 selected: 0,
                 error: None,
                 tab: ChangeTab::Active,
+                change_deps: HashMap::new(),
             },
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            batch: None,
             config: TuiConfig::default(),
         };
 
@@ -607,6 +1092,7 @@ mod tests {
             selected: 0,
             error: None,
             tab: ChangeTab::Active,
+            change_deps: HashMap::new(),
         };
 
         let mut app = App {
@@ -620,6 +1106,7 @@ mod tests {
             screen_stack: vec![original_screen],
             should_quit: false,
             implementation: None,
+            batch: None,
             config: TuiConfig::default(),
         };
 
@@ -648,6 +1135,7 @@ mod tests {
             screen_stack: vec![menu_screen],
             should_quit: false,
             implementation: None,
+            batch: None,
             config: TuiConfig::default(),
         };
 
@@ -682,10 +1170,12 @@ mod tests {
                 selected: 0,
                 error: None,
                 tab: ChangeTab::Active,
+                change_deps: HashMap::new(),
             },
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            batch: None,
             config: TuiConfig::default(),
         };
 
@@ -737,6 +1227,7 @@ mod tests {
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            batch: None,
             config: TuiConfig::default(),
         };
 
@@ -777,18 +1268,21 @@ mod tests {
                 available: true,
                 file_path: Some(PathBuf::from("/tmp/proposal.md")),
                 is_spec_header: false,
+                is_dependency_item: false,
             },
             ArtifactMenuItem {
                 label: "Design".to_string(),
                 available: false,
                 file_path: None,
                 is_spec_header: false,
+                is_dependency_item: false,
             },
             ArtifactMenuItem {
                 label: "Tasks".to_string(),
                 available: true,
                 file_path: Some(PathBuf::from("/tmp/tasks.md")),
                 is_spec_header: false,
+                is_dependency_item: false,
             },
         ];
 
@@ -803,6 +1297,7 @@ mod tests {
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            batch: None,
             config: TuiConfig::default(),
         };
 
@@ -825,7 +1320,7 @@ mod tests {
             ("specs", "done"),
         ]);
         let change_dir = PathBuf::from("/tmp/nonexistent");
-        let items = build_artifact_menu_items(&status, &change_dir);
+        let items = build_artifact_menu_items(&status, &change_dir, false);
 
         assert_eq!(items[0].label, "Proposal");
         assert!(items[0].available);
@@ -847,7 +1342,7 @@ mod tests {
             ("specs", "pending"),
         ]);
         let change_dir = PathBuf::from("/tmp/nonexistent");
-        let items = build_artifact_menu_items(&status, &change_dir);
+        let items = build_artifact_menu_items(&status, &change_dir, false);
 
         assert!(items[0].available); // proposal done
         assert!(!items[1].available); // design pending
@@ -866,6 +1361,7 @@ mod tests {
                     available: false,
                     file_path: None,
                     is_spec_header: false,
+                    is_dependency_item: false,
                 }],
                 selected: 0,
                 is_archived: false,
@@ -873,6 +1369,7 @@ mod tests {
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            batch: None,
             config: TuiConfig::default(),
         };
 
@@ -892,6 +1389,7 @@ mod tests {
                     available: true,
                     file_path: None,
                     is_spec_header: true,
+                    is_dependency_item: false,
                 }],
                 selected: 0,
                 is_archived: false,
@@ -899,6 +1397,7 @@ mod tests {
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            batch: None,
             config: TuiConfig::default(),
         };
 
@@ -919,6 +1418,7 @@ mod tests {
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            batch: None,
             config: TuiConfig::default(),
         };
 
@@ -958,6 +1458,7 @@ mod tests {
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: Some(existing_impl),
+            batch: None,
             config: TuiConfig::default(),
         };
 
@@ -993,10 +1494,12 @@ mod tests {
                 selected: 0,
                 error: None,
                 tab: ChangeTab::Active,
+                change_deps: HashMap::new(),
             },
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: Some(existing_impl),
+            batch: None,
             config: TuiConfig::default(),
         };
 
@@ -1014,10 +1517,12 @@ mod tests {
                 selected: 0,
                 error: None,
                 tab: ChangeTab::Active,
+                change_deps: HashMap::new(),
             },
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            batch: None,
             config: TuiConfig::default(),
         };
 
@@ -1054,6 +1559,7 @@ mod tests {
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: Some(existing_impl),
+            batch: None,
             config: TuiConfig::default(),
         };
 
@@ -1093,6 +1599,7 @@ mod tests {
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: Some(existing_impl),
+            batch: None,
             config: TuiConfig::default(),
         };
 
@@ -1125,10 +1632,12 @@ mod tests {
                 selected: 0,
                 error: None,
                 tab: ChangeTab::Active,
+                change_deps: HashMap::new(),
             },
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: Some(impl_state),
+            batch: None,
             config: TuiConfig::default(),
         };
 
@@ -1174,10 +1683,12 @@ mod tests {
                 selected: 0,
                 error: None,
                 tab: ChangeTab::Active,
+                change_deps: HashMap::new(),
             },
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: Some(impl_state),
+            batch: None,
             config: TuiConfig::default(),
         };
 
@@ -1210,10 +1721,12 @@ mod tests {
                 selected: 0,
                 error: None,
                 tab: ChangeTab::Active,
+                change_deps: HashMap::new(),
             },
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: Some(impl_state),
+            batch: None,
             config: TuiConfig::default(),
         };
 
@@ -1239,10 +1752,12 @@ mod tests {
                 selected: 0,
                 error: None,
                 tab: ChangeTab::Active,
+                change_deps: HashMap::new(),
             },
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            batch: None,
             config: TuiConfig::default(),
         };
 
@@ -1273,10 +1788,12 @@ mod tests {
                 selected: 0,
                 error: None,
                 tab: ChangeTab::Active,
+                change_deps: HashMap::new(),
             },
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: Some(impl_state),
+            batch: None,
             config: TuiConfig::default(),
         };
 
@@ -1301,14 +1818,13 @@ mod tests {
             ("tasks", "done"),
             ("specs", "pending"),
         ]);
-        let items = build_artifact_menu_items(&status, &dir);
+        let items = build_artifact_menu_items(&status, &dir, false);
 
-        // Should have: Proposal, Design, Tasks, Specs header, Implementation Log
-        let last = items.last().unwrap();
-        assert_eq!(last.label, "Implementation Log");
-        assert!(last.available);
-        assert_eq!(last.file_path, Some(dir.join("implementation.log")));
-        assert!(!last.is_spec_header);
+        // Should have: Proposal, Design, Tasks, Specs header, Implementation Log, Dependencies [0]
+        let log_item = items.iter().find(|i| i.label == "Implementation Log").unwrap();
+        assert!(log_item.available);
+        assert_eq!(log_item.file_path, Some(dir.join("implementation.log")));
+        assert!(!log_item.is_spec_header);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1325,7 +1841,7 @@ mod tests {
             ("tasks", "done"),
             ("specs", "pending"),
         ]);
-        let items = build_artifact_menu_items(&status, &dir);
+        let items = build_artifact_menu_items(&status, &dir, false);
 
         // No item should have the "Implementation Log" label
         assert!(
@@ -1344,10 +1860,12 @@ mod tests {
                 selected: 0,
                 error: None,
                 tab: ChangeTab::Active,
+                change_deps: HashMap::new(),
             },
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            batch: None,
             config: TuiConfig::default(),
         };
 
@@ -1371,10 +1889,12 @@ mod tests {
                 selected: 0,
                 error: None,
                 tab: ChangeTab::Active,
+                change_deps: HashMap::new(),
             },
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            batch: None,
             config: TuiConfig::default(),
         };
 
@@ -1395,10 +1915,12 @@ mod tests {
                 selected: 0,
                 error: None,
                 tab: ChangeTab::Archived,
+                change_deps: HashMap::new(),
             },
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            batch: None,
             config: TuiConfig::default(),
         };
 
@@ -1423,10 +1945,12 @@ mod tests {
                 selected: 0,
                 error: None,
                 tab: ChangeTab::Active,
+                change_deps: HashMap::new(),
             },
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            batch: None,
             config: TuiConfig::default(),
         };
 
@@ -1449,10 +1973,12 @@ mod tests {
                 selected: 0,
                 error: None,
                 tab: ChangeTab::Archived,
+                change_deps: HashMap::new(),
             },
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            batch: None,
             config: TuiConfig::default(),
         };
 
@@ -1472,10 +1998,12 @@ mod tests {
                 selected: 0,
                 error: None,
                 tab: ChangeTab::Active,
+                change_deps: HashMap::new(),
             },
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            batch: None,
             config: TuiConfig::default(),
         };
 
@@ -1513,10 +2041,12 @@ mod tests {
                 selected: 1,
                 error: None,
                 tab: ChangeTab::Active,
+                change_deps: HashMap::new(),
             },
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            batch: None,
             config: TuiConfig::default(),
         };
 
@@ -1539,6 +2069,7 @@ mod tests {
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            batch: None,
             config: TuiConfig::default(),
         };
 
@@ -1562,6 +2093,7 @@ mod tests {
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            batch: None,
             config: TuiConfig::default(),
         };
 
@@ -1580,10 +2112,12 @@ mod tests {
                 selected: 0,
                 error: None,
                 tab: ChangeTab::Active,
+                change_deps: HashMap::new(),
             },
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            batch: None,
             config: TuiConfig::default(),
         };
 
@@ -1600,10 +2134,12 @@ mod tests {
                 selected: 0,
                 error: None,
                 tab: ChangeTab::Archived,
+                change_deps: HashMap::new(),
             },
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            batch: None,
             config: TuiConfig::default(),
         };
 
@@ -1628,6 +2164,7 @@ mod tests {
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            batch: None,
             config: TuiConfig::default(),
         };
 
@@ -1669,6 +2206,7 @@ mod tests {
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            batch: None,
             config: TuiConfig::default(),
         };
 
@@ -1700,6 +2238,7 @@ mod tests {
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            batch: None,
             config: TuiConfig::default(),
         };
 
@@ -1733,6 +2272,7 @@ mod tests {
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            batch: None,
             config: TuiConfig::default(),
         };
 
@@ -1770,6 +2310,7 @@ mod tests {
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            batch: None,
             config: TuiConfig::default(),
         };
 
@@ -1793,10 +2334,12 @@ mod tests {
                 selected: 0,
                 error: None,
                 tab: ChangeTab::Active,
+                change_deps: HashMap::new(),
             },
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            batch: None,
             config: TuiConfig {
                 command: "test-tool {prompt}".to_string(),
                 prompt: "test prompt {name}".to_string(),
@@ -1826,6 +2369,7 @@ mod tests {
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            batch: None,
             config: TuiConfig::default(),
         };
         app.handle_artifact_menu_input(KeyCode::Char('C'));
@@ -1844,6 +2388,7 @@ mod tests {
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            batch: None,
             config: TuiConfig::default(),
         };
         app.handle_artifact_view_input(KeyCode::Char('C'));
@@ -2232,5 +2777,1140 @@ mod tests {
         if let Screen::Config { command, .. } = &app.screen {
             assert_eq!(command, &original);
         }
+    }
+
+    // --- Dependency View Tests ---
+
+    fn make_dependency_view_app(deps: Vec<&str>) -> App {
+        App {
+            screen: Screen::DependencyView {
+                change_name: "test-change".to_string(),
+                change_dir: PathBuf::from("/tmp/nonexistent"),
+                dependencies: deps.into_iter().map(String::from).collect(),
+                selected: 0,
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: None,
+            batch: None,
+            config: TuiConfig::default(),
+        }
+    }
+
+    #[test]
+    fn test_dependency_view_navigation() {
+        let mut app = make_dependency_view_app(vec!["dep-a", "dep-b", "dep-c"]);
+
+        app.handle_dependency_view_input(KeyCode::Char('j'));
+        if let Screen::DependencyView { selected, .. } = &app.screen {
+            assert_eq!(*selected, 1);
+        }
+
+        app.handle_dependency_view_input(KeyCode::Down);
+        if let Screen::DependencyView { selected, .. } = &app.screen {
+            assert_eq!(*selected, 2);
+        }
+
+        // At bottom, stays
+        app.handle_dependency_view_input(KeyCode::Down);
+        if let Screen::DependencyView { selected, .. } = &app.screen {
+            assert_eq!(*selected, 2);
+        }
+
+        app.handle_dependency_view_input(KeyCode::Char('k'));
+        if let Screen::DependencyView { selected, .. } = &app.screen {
+            assert_eq!(*selected, 1);
+        }
+
+        app.handle_dependency_view_input(KeyCode::Up);
+        if let Screen::DependencyView { selected, .. } = &app.screen {
+            assert_eq!(*selected, 0);
+        }
+
+        // At top, stays
+        app.handle_dependency_view_input(KeyCode::Up);
+        if let Screen::DependencyView { selected, .. } = &app.screen {
+            assert_eq!(*selected, 0);
+        }
+    }
+
+    #[test]
+    fn test_dependency_view_remove() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-dep-remove");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut app = App {
+            screen: Screen::DependencyView {
+                change_name: "test-change".to_string(),
+                change_dir: dir.clone(),
+                dependencies: vec!["dep-a".to_string(), "dep-b".to_string(), "dep-c".to_string()],
+                selected: 1,
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: None,
+            batch: None,
+            config: TuiConfig::default(),
+        };
+
+        // Remove dep-b (selected=1)
+        app.handle_dependency_view_input(KeyCode::Char('D'));
+        if let Screen::DependencyView { dependencies, selected, .. } = &app.screen {
+            assert_eq!(dependencies, &vec!["dep-a".to_string(), "dep-c".to_string()]);
+            assert_eq!(*selected, 1); // stays at 1, now pointing to dep-c
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_dependency_view_remove_last_adjusts_selection() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-dep-remove-last");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut app = App {
+            screen: Screen::DependencyView {
+                change_name: "test-change".to_string(),
+                change_dir: dir.clone(),
+                dependencies: vec!["dep-a".to_string(), "dep-b".to_string()],
+                selected: 1,
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: None,
+            batch: None,
+            config: TuiConfig::default(),
+        };
+
+        // Remove dep-b (last item, selected=1)
+        app.handle_dependency_view_input(KeyCode::Char('D'));
+        if let Screen::DependencyView { dependencies, selected, .. } = &app.screen {
+            assert_eq!(dependencies, &vec!["dep-a".to_string()]);
+            assert_eq!(*selected, 0); // adjusted back
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_dependency_view_remove_on_empty_is_noop() {
+        let mut app = make_dependency_view_app(vec![]);
+
+        app.handle_dependency_view_input(KeyCode::Char('D'));
+        if let Screen::DependencyView { dependencies, .. } = &app.screen {
+            assert!(dependencies.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_dependency_view_esc_goes_back() {
+        let parent_screen = Screen::ArtifactMenu {
+            change_name: "test-change".to_string(),
+            change_dir: PathBuf::from("/tmp"),
+            items: vec![],
+            selected: 0,
+            is_archived: false,
+        };
+
+        let mut app = App {
+            screen: Screen::DependencyView {
+                change_name: "test-change".to_string(),
+                change_dir: PathBuf::from("/tmp"),
+                dependencies: vec!["dep-a".to_string()],
+                selected: 0,
+            },
+            screen_stack: vec![parent_screen],
+            should_quit: false,
+            implementation: None,
+            batch: None,
+            config: TuiConfig::default(),
+        };
+
+        app.handle_dependency_view_input(KeyCode::Esc);
+        assert!(matches!(app.screen, Screen::ArtifactMenu { .. }));
+        assert!(app.screen_stack.is_empty());
+    }
+
+    // --- Dependency Add Tests ---
+
+    #[test]
+    fn test_dependency_add_navigation() {
+        let mut app = App {
+            screen: Screen::DependencyAdd {
+                change_name: "test-change".to_string(),
+                change_dir: PathBuf::from("/tmp"),
+                available_changes: vec!["change-a".to_string(), "change-b".to_string(), "change-c".to_string()],
+                selected: 0,
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: None,
+            batch: None,
+            config: TuiConfig::default(),
+        };
+
+        app.handle_dependency_add_input(KeyCode::Char('j'));
+        if let Screen::DependencyAdd { selected, .. } = &app.screen {
+            assert_eq!(*selected, 1);
+        }
+
+        app.handle_dependency_add_input(KeyCode::Down);
+        if let Screen::DependencyAdd { selected, .. } = &app.screen {
+            assert_eq!(*selected, 2);
+        }
+
+        // At bottom, stays
+        app.handle_dependency_add_input(KeyCode::Down);
+        if let Screen::DependencyAdd { selected, .. } = &app.screen {
+            assert_eq!(*selected, 2);
+        }
+
+        app.handle_dependency_add_input(KeyCode::Up);
+        if let Screen::DependencyAdd { selected, .. } = &app.screen {
+            assert_eq!(*selected, 1);
+        }
+    }
+
+    #[test]
+    fn test_dependency_add_enter_adds_and_returns() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-dep-add-enter");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let dep_view = Screen::DependencyView {
+            change_name: "test-change".to_string(),
+            change_dir: dir.clone(),
+            dependencies: vec!["existing-dep".to_string()],
+            selected: 0,
+        };
+
+        let mut app = App {
+            screen: Screen::DependencyAdd {
+                change_name: "test-change".to_string(),
+                change_dir: dir.clone(),
+                available_changes: vec!["new-dep".to_string()],
+                selected: 0,
+            },
+            screen_stack: vec![dep_view],
+            should_quit: false,
+            implementation: None,
+            batch: None,
+            config: TuiConfig::default(),
+        };
+
+        app.handle_dependency_add_input(KeyCode::Enter);
+
+        // Should return to DependencyView with new dep added
+        if let Screen::DependencyView { dependencies, .. } = &app.screen {
+            assert_eq!(dependencies, &vec!["existing-dep".to_string(), "new-dep".to_string()]);
+        } else {
+            panic!("Expected DependencyView screen");
+        }
+        assert!(app.screen_stack.is_empty());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_dependency_add_esc_cancels() {
+        let dep_view = Screen::DependencyView {
+            change_name: "test-change".to_string(),
+            change_dir: PathBuf::from("/tmp"),
+            dependencies: vec!["existing-dep".to_string()],
+            selected: 0,
+        };
+
+        let mut app = App {
+            screen: Screen::DependencyAdd {
+                change_name: "test-change".to_string(),
+                change_dir: PathBuf::from("/tmp"),
+                available_changes: vec!["new-dep".to_string()],
+                selected: 0,
+            },
+            screen_stack: vec![dep_view],
+            should_quit: false,
+            implementation: None,
+            batch: None,
+            config: TuiConfig::default(),
+        };
+
+        app.handle_dependency_add_input(KeyCode::Esc);
+
+        // Should return to DependencyView without adding
+        if let Screen::DependencyView { dependencies, .. } = &app.screen {
+            assert_eq!(dependencies, &vec!["existing-dep".to_string()]);
+        } else {
+            panic!("Expected DependencyView screen");
+        }
+    }
+
+    #[test]
+    fn test_dependencies_item_appears_for_active_change() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-dep-item-active");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let status = make_status(vec![
+            ("proposal", "done"),
+            ("design", "done"),
+            ("tasks", "done"),
+            ("specs", "pending"),
+        ]);
+        let items = build_artifact_menu_items(&status, &dir, false);
+
+        let dep_item = items.iter().find(|i| i.is_dependency_item);
+        assert!(dep_item.is_some(), "Dependencies item should appear for active changes");
+        assert_eq!(dep_item.unwrap().label, "Dependencies [0]");
+        assert!(dep_item.unwrap().available);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_dependencies_item_shows_count() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-dep-item-count");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("dependencies.yaml"),
+            "depends_on:\n  - change-a\n  - change-b\n",
+        )
+        .unwrap();
+
+        let status = make_status(vec![
+            ("proposal", "done"),
+            ("design", "done"),
+            ("tasks", "done"),
+            ("specs", "pending"),
+        ]);
+        let items = build_artifact_menu_items(&status, &dir, false);
+
+        let dep_item = items.iter().find(|i| i.is_dependency_item).unwrap();
+        assert_eq!(dep_item.label, "Dependencies [2]");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_dependencies_item_not_shown_for_archived_change() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-dep-item-archived");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let status = make_status(vec![
+            ("proposal", "done"),
+            ("design", "done"),
+            ("tasks", "done"),
+            ("specs", "done"),
+        ]);
+        let items = build_artifact_menu_items(&status, &dir, true);
+
+        let dep_item = items.iter().find(|i| i.is_dependency_item);
+        assert!(
+            dep_item.is_none(),
+            "Dependencies item should not appear for archived changes"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_enter_on_dependencies_item_opens_dependency_view() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-dep-item-enter");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("dependencies.yaml"),
+            "depends_on:\n  - dep-one\n",
+        )
+        .unwrap();
+
+        let mut app = App {
+            screen: Screen::ArtifactMenu {
+                change_name: "my-change".to_string(),
+                change_dir: dir.clone(),
+                items: vec![ArtifactMenuItem {
+                    label: "Dependencies [1]".to_string(),
+                    available: true,
+                    file_path: None,
+                    is_spec_header: false,
+                    is_dependency_item: true,
+                }],
+                selected: 0,
+                is_archived: false,
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: None,
+            batch: None,
+            config: TuiConfig::default(),
+        };
+
+        app.handle_artifact_menu_input(KeyCode::Enter);
+
+        if let Screen::DependencyView {
+            change_name,
+            dependencies,
+            ..
+        } = &app.screen
+        {
+            assert_eq!(change_name, "my-change");
+            assert_eq!(dependencies, &vec!["dep-one".to_string()]);
+        } else {
+            panic!("Expected DependencyView screen");
+        }
+
+        // Previous screen should be on the stack
+        assert_eq!(app.screen_stack.len(), 1);
+        assert!(matches!(
+            app.screen_stack[0],
+            Screen::ArtifactMenu { .. }
+        ));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_dependency_graph_scrolling() {
+        let mut app = App {
+            screen: Screen::DependencyGraph {
+                graph_text: "line1\nline2\nline3\nline4\nline5".to_string(),
+                scroll: 0,
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: None,
+            batch: None,
+            config: TuiConfig::default(),
+        };
+
+        // Scroll down
+        app.handle_dependency_graph_input(KeyCode::Char('j'));
+        if let Screen::DependencyGraph { scroll, .. } = &app.screen {
+            assert_eq!(*scroll, 1);
+        }
+
+        app.handle_dependency_graph_input(KeyCode::Down);
+        if let Screen::DependencyGraph { scroll, .. } = &app.screen {
+            assert_eq!(*scroll, 2);
+        }
+
+        // Scroll up
+        app.handle_dependency_graph_input(KeyCode::Char('k'));
+        if let Screen::DependencyGraph { scroll, .. } = &app.screen {
+            assert_eq!(*scroll, 1);
+        }
+
+        app.handle_dependency_graph_input(KeyCode::Up);
+        if let Screen::DependencyGraph { scroll, .. } = &app.screen {
+            assert_eq!(*scroll, 0);
+        }
+
+        // At top, stays
+        app.handle_dependency_graph_input(KeyCode::Up);
+        if let Screen::DependencyGraph { scroll, .. } = &app.screen {
+            assert_eq!(*scroll, 0);
+        }
+    }
+
+    #[test]
+    fn test_dependency_graph_esc_returns() {
+        let parent = Screen::ChangeList {
+            changes: vec![],
+            selected: 0,
+            error: None,
+            tab: ChangeTab::Active,
+            change_deps: HashMap::new(),
+        };
+
+        let mut app = App {
+            screen: Screen::DependencyGraph {
+                graph_text: "root".to_string(),
+                scroll: 0,
+            },
+            screen_stack: vec![parent],
+            should_quit: false,
+            implementation: None,
+            batch: None,
+            config: TuiConfig::default(),
+        };
+
+        app.handle_dependency_graph_input(KeyCode::Esc);
+        assert!(matches!(app.screen, Screen::ChangeList { .. }));
+        assert!(app.screen_stack.is_empty());
+    }
+
+    #[test]
+    fn test_change_list_g_opens_dependency_graph() {
+        let mut change_deps = HashMap::new();
+        change_deps.insert("b".to_string(), vec!["a".to_string()]);
+
+        let mut app = App {
+            screen: Screen::ChangeList {
+                changes: vec![
+                    ChangeEntry {
+                        name: "a".to_string(),
+                        completed_tasks: 0,
+                        total_tasks: 1,
+                        status: "in-progress".to_string(),
+                    },
+                    ChangeEntry {
+                        name: "b".to_string(),
+                        completed_tasks: 0,
+                        total_tasks: 1,
+                        status: "in-progress".to_string(),
+                    },
+                ],
+                selected: 0,
+                error: None,
+                tab: ChangeTab::Active,
+                change_deps,
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: None,
+            batch: None,
+            config: TuiConfig::default(),
+        };
+
+        app.handle_change_list_input(KeyCode::Char('G'));
+        assert!(matches!(app.screen, Screen::DependencyGraph { .. }));
+        assert_eq!(app.screen_stack.len(), 1);
+    }
+
+    #[test]
+    fn test_change_list_g_ignored_on_archived_tab() {
+        let mut app = App {
+            screen: Screen::ChangeList {
+                changes: vec![],
+                selected: 0,
+                error: None,
+                tab: ChangeTab::Archived,
+                change_deps: HashMap::new(),
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: None,
+            batch: None,
+            config: TuiConfig::default(),
+        };
+
+        app.handle_change_list_input(KeyCode::Char('G'));
+        assert!(matches!(app.screen, Screen::ChangeList { .. }));
+        assert!(app.screen_stack.is_empty());
+    }
+
+    // --- RunAllSelection tests ---
+
+    fn make_run_all_app(entries: Vec<RunAllEntry>) -> App {
+        App {
+            screen: Screen::RunAllSelection {
+                entries,
+                selected: 0,
+                error: None,
+            },
+            screen_stack: vec![Screen::ChangeList {
+                changes: vec![],
+                selected: 0,
+                error: None,
+                tab: ChangeTab::Active,
+                change_deps: HashMap::new(),
+            }],
+            should_quit: false,
+            implementation: None,
+            batch: None,
+            config: TuiConfig::default(),
+        }
+    }
+
+    fn make_entry(name: &str, included: bool, blocked: bool) -> RunAllEntry {
+        RunAllEntry {
+            change_name: name.to_string(),
+            included,
+            blocked,
+            blocked_by: if blocked {
+                Some("some-dep".to_string())
+            } else {
+                None
+            },
+            completed_tasks: 0,
+            total_tasks: 5,
+        }
+    }
+
+    #[test]
+    fn test_run_all_selection_navigation() {
+        let entries = vec![
+            make_entry("change-a", true, false),
+            make_entry("change-b", true, false),
+            make_entry("change-c", true, false),
+        ];
+        let mut app = make_run_all_app(entries);
+
+        // Move down
+        app.handle_run_all_selection_input(KeyCode::Char('j'));
+        if let Screen::RunAllSelection { selected, .. } = &app.screen {
+            assert_eq!(*selected, 1);
+        }
+
+        app.handle_run_all_selection_input(KeyCode::Down);
+        if let Screen::RunAllSelection { selected, .. } = &app.screen {
+            assert_eq!(*selected, 2);
+        }
+
+        // At bottom, stays
+        app.handle_run_all_selection_input(KeyCode::Down);
+        if let Screen::RunAllSelection { selected, .. } = &app.screen {
+            assert_eq!(*selected, 2);
+        }
+
+        // Move up
+        app.handle_run_all_selection_input(KeyCode::Char('k'));
+        if let Screen::RunAllSelection { selected, .. } = &app.screen {
+            assert_eq!(*selected, 1);
+        }
+
+        app.handle_run_all_selection_input(KeyCode::Up);
+        if let Screen::RunAllSelection { selected, .. } = &app.screen {
+            assert_eq!(*selected, 0);
+        }
+
+        // At top, stays
+        app.handle_run_all_selection_input(KeyCode::Up);
+        if let Screen::RunAllSelection { selected, .. } = &app.screen {
+            assert_eq!(*selected, 0);
+        }
+    }
+
+    #[test]
+    fn test_run_all_selection_toggle() {
+        let entries = vec![
+            make_entry("change-a", true, false),
+            make_entry("change-b", true, false),
+        ];
+        let mut app = make_run_all_app(entries);
+
+        // Toggle off
+        app.handle_run_all_selection_input(KeyCode::Char(' '));
+        if let Screen::RunAllSelection { entries, .. } = &app.screen {
+            assert!(!entries[0].included);
+            assert!(entries[1].included);
+        }
+
+        // Toggle back on
+        app.handle_run_all_selection_input(KeyCode::Char(' '));
+        if let Screen::RunAllSelection { entries, .. } = &app.screen {
+            assert!(entries[0].included);
+        }
+    }
+
+    #[test]
+    fn test_run_all_selection_toggle_blocked_is_noop() {
+        let entries = vec![make_entry("change-a", false, true)];
+        let mut app = make_run_all_app(entries);
+
+        app.handle_run_all_selection_input(KeyCode::Char(' '));
+        if let Screen::RunAllSelection { entries, .. } = &app.screen {
+            assert!(!entries[0].included);
+            assert!(entries[0].blocked);
+        }
+    }
+
+    #[test]
+    fn test_run_all_selection_esc_cancels() {
+        let entries = vec![make_entry("change-a", true, false)];
+        let mut app = make_run_all_app(entries);
+
+        app.handle_run_all_selection_input(KeyCode::Esc);
+        assert!(matches!(app.screen, Screen::ChangeList { .. }));
+        assert!(app.screen_stack.is_empty());
+    }
+
+    #[test]
+    fn test_run_all_selection_enter_empty_shows_error() {
+        let entries = vec![make_entry("change-a", false, false)];
+        let mut app = make_run_all_app(entries);
+
+        app.handle_run_all_selection_input(KeyCode::Enter);
+        if let Screen::RunAllSelection { error, .. } = &app.screen {
+            assert!(error.is_some());
+            assert!(error.as_ref().unwrap().contains("No changes selected"));
+        }
+    }
+
+    #[test]
+    fn test_run_all_selection_a_keybinding_opens_from_change_list() {
+        let mut app = App {
+            screen: Screen::ChangeList {
+                changes: vec![ChangeEntry {
+                    name: "test".to_string(),
+                    completed_tasks: 0,
+                    total_tasks: 5,
+                    status: "in-progress".to_string(),
+                }],
+                selected: 0,
+                error: None,
+                tab: ChangeTab::Active,
+                change_deps: HashMap::new(),
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: None,
+            batch: None,
+            config: TuiConfig::default(),
+        };
+
+        app.handle_change_list_input(KeyCode::Char('A'));
+        assert!(matches!(app.screen, Screen::RunAllSelection { .. }));
+        assert_eq!(app.screen_stack.len(), 1);
+    }
+
+    #[test]
+    fn test_run_all_selection_a_ignored_on_archived_tab() {
+        let mut app = App {
+            screen: Screen::ChangeList {
+                changes: vec![],
+                selected: 0,
+                error: None,
+                tab: ChangeTab::Archived,
+                change_deps: HashMap::new(),
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: None,
+            batch: None,
+            config: TuiConfig::default(),
+        };
+
+        app.handle_change_list_input(KeyCode::Char('A'));
+        assert!(matches!(app.screen, Screen::ChangeList { .. }));
+        assert!(app.screen_stack.is_empty());
+    }
+
+    #[test]
+    fn test_run_all_selection_a_ignored_when_implementation_running() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{mpsc, Arc, Mutex};
+
+        let (_tx, rx) = mpsc::channel();
+        let existing_impl = crate::runner::ImplState {
+            change_name: "existing".to_string(),
+            completed: 1,
+            total: 5,
+            log_path: PathBuf::from("/tmp/test.log"),
+            receiver: rx,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            child_handle: Arc::new(Mutex::new(None)),
+        };
+
+        let mut app = App {
+            screen: Screen::ChangeList {
+                changes: vec![ChangeEntry {
+                    name: "test".to_string(),
+                    completed_tasks: 0,
+                    total_tasks: 5,
+                    status: "in-progress".to_string(),
+                }],
+                selected: 0,
+                error: None,
+                tab: ChangeTab::Active,
+                change_deps: HashMap::new(),
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: Some(existing_impl),
+            batch: None,
+            config: TuiConfig::default(),
+        };
+
+        app.handle_change_list_input(KeyCode::Char('A'));
+        assert!(matches!(app.screen, Screen::ChangeList { .. }));
+        assert!(app.screen_stack.is_empty());
+    }
+
+    #[test]
+    fn test_run_all_entry_fields() {
+        let entry = RunAllEntry {
+            change_name: "my-change".to_string(),
+            included: true,
+            blocked: false,
+            blocked_by: None,
+            completed_tasks: 3,
+            total_tasks: 7,
+        };
+        assert_eq!(entry.change_name, "my-change");
+        assert!(entry.included);
+        assert!(!entry.blocked);
+        assert!(entry.blocked_by.is_none());
+        assert_eq!(entry.completed_tasks, 3);
+        assert_eq!(entry.total_tasks, 7);
+    }
+
+    #[test]
+    fn test_run_all_enter_starts_batch_and_implementation() {
+        let entries = vec![
+            make_entry("change-a", true, false),
+            make_entry("change-b", true, false),
+        ];
+        let mut app = make_run_all_app(entries);
+
+        app.handle_run_all_selection_input(KeyCode::Enter);
+
+        // Should navigate back to ChangeList
+        assert!(matches!(app.screen, Screen::ChangeList { .. }));
+
+        // Batch should be set with the two changes
+        assert!(app.batch.is_some());
+        let batch = app.batch.as_ref().unwrap();
+        assert_eq!(batch.queue.len(), 2);
+        assert!(batch.queue.contains(&"change-a".to_string()));
+        assert!(batch.queue.contains(&"change-b".to_string()));
+        assert_eq!(batch.current_index, 0);
+
+        // Implementation should be started for the first change in the queue
+        assert!(app.implementation.is_some());
+        let impl_state = app.implementation.as_ref().unwrap();
+        assert_eq!(impl_state.change_name, batch.queue[0]);
+
+        // Clean up: stop the implementation thread
+        app.stop_running_implementation();
+    }
+
+    #[test]
+    fn test_run_all_enter_no_batch_when_none_included() {
+        let entries = vec![make_entry("change-a", false, false)];
+        let mut app = make_run_all_app(entries);
+
+        app.handle_run_all_selection_input(KeyCode::Enter);
+
+        // Should show error, not start batch
+        assert!(matches!(app.screen, Screen::RunAllSelection { .. }));
+        assert!(app.batch.is_none());
+        assert!(app.implementation.is_none());
+    }
+
+    #[test]
+    fn test_poll_implementation_finished_clears_single_batch() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{mpsc, Arc, Mutex};
+
+        let (tx, rx) = mpsc::channel();
+        let impl_state = crate::runner::ImplState {
+            change_name: "change-a".to_string(),
+            completed: 0,
+            total: 5,
+            log_path: PathBuf::from("/tmp/test.log"),
+            receiver: rx,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            child_handle: Arc::new(Mutex::new(None)),
+        };
+
+        let batch = BatchImplState::new(vec!["change-a".to_string()], HashMap::new());
+
+        let mut app = App {
+            screen: Screen::ChangeList {
+                changes: vec![],
+                selected: 0,
+                error: None,
+                tab: ChangeTab::Active,
+                change_deps: HashMap::new(),
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: Some(impl_state),
+            batch: Some(batch),
+            config: TuiConfig::default(),
+        };
+
+        tx.send(crate::runner::ImplUpdate::Finished).unwrap();
+        app.poll_implementation();
+
+        // Implementation should be cleared
+        assert!(app.implementation.is_none());
+        // Batch should be cleared (only one change, now finished)
+        assert!(app.batch.is_none());
+    }
+
+    #[test]
+    fn test_poll_implementation_finished_advances_batch_to_next() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{mpsc, Arc, Mutex};
+
+        let (tx, rx) = mpsc::channel();
+        let impl_state = crate::runner::ImplState {
+            change_name: "change-a".to_string(),
+            completed: 0,
+            total: 5,
+            log_path: PathBuf::from("/tmp/test.log"),
+            receiver: rx,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            child_handle: Arc::new(Mutex::new(None)),
+        };
+
+        // Two independent changes
+        let batch = BatchImplState::new(
+            vec!["change-a".to_string(), "change-b".to_string()],
+            HashMap::new(),
+        );
+
+        let mut app = App {
+            screen: Screen::ChangeList {
+                changes: vec![],
+                selected: 0,
+                error: None,
+                tab: ChangeTab::Active,
+                change_deps: HashMap::new(),
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: Some(impl_state),
+            batch: Some(batch),
+            config: TuiConfig::default(),
+        };
+
+        tx.send(crate::runner::ImplUpdate::Finished).unwrap();
+        app.poll_implementation();
+
+        // Implementation should be started for change-b
+        assert!(app.implementation.is_some());
+        assert_eq!(
+            app.implementation.as_ref().unwrap().change_name,
+            "change-b"
+        );
+        // Batch should still be active at index 1
+        assert!(app.batch.is_some());
+        assert_eq!(app.batch.as_ref().unwrap().current_index, 1);
+
+        // Clean up spawned implementation thread
+        app.stop_running_implementation();
+    }
+
+    #[test]
+    fn test_poll_implementation_finished_skips_dependent_on_failure() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{mpsc, Arc, Mutex};
+
+        let (tx, rx) = mpsc::channel();
+        let impl_state = crate::runner::ImplState {
+            change_name: "change-a".to_string(),
+            completed: 0,
+            total: 5,
+            log_path: PathBuf::from("/tmp/test.log"),
+            receiver: rx,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            child_handle: Arc::new(Mutex::new(None)),
+        };
+
+        // change-b depends on change-a, change-c is independent
+        let mut deps = HashMap::new();
+        deps.insert("change-b".to_string(), vec!["change-a".to_string()]);
+        let batch = BatchImplState::new(
+            vec![
+                "change-a".to_string(),
+                "change-b".to_string(),
+                "change-c".to_string(),
+            ],
+            deps,
+        );
+
+        let mut app = App {
+            screen: Screen::ChangeList {
+                changes: vec![],
+                selected: 0,
+                error: None,
+                tab: ChangeTab::Active,
+                change_deps: HashMap::new(),
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: Some(impl_state),
+            batch: Some(batch),
+            config: TuiConfig::default(),
+        };
+
+        tx.send(crate::runner::ImplUpdate::Finished).unwrap();
+        app.poll_implementation();
+
+        // change-b should be skipped (depends on failed change-a),
+        // change-c should be started (independent)
+        assert!(app.implementation.is_some());
+        assert_eq!(
+            app.implementation.as_ref().unwrap().change_name,
+            "change-c"
+        );
+        let batch = app.batch.as_ref().unwrap();
+        assert!(batch.failed.contains("change-a"));
+        assert!(batch.skipped.contains("change-b"));
+        assert_eq!(batch.current_index, 2);
+
+        // Clean up spawned implementation thread
+        app.stop_running_implementation();
+    }
+
+    #[test]
+    fn test_poll_implementation_finished_no_batch_unchanged() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{mpsc, Arc, Mutex};
+
+        let (tx, rx) = mpsc::channel();
+        let impl_state = crate::runner::ImplState {
+            change_name: "test-change".to_string(),
+            completed: 5,
+            total: 5,
+            log_path: PathBuf::from("/tmp/test.log"),
+            receiver: rx,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            child_handle: Arc::new(Mutex::new(None)),
+        };
+
+        let mut app = App {
+            screen: Screen::ChangeList {
+                changes: vec![],
+                selected: 0,
+                error: None,
+                tab: ChangeTab::Active,
+                change_deps: HashMap::new(),
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: Some(impl_state),
+            batch: None,
+            config: TuiConfig::default(),
+        };
+
+        tx.send(crate::runner::ImplUpdate::Finished).unwrap();
+        app.poll_implementation();
+
+        // Implementation cleared, no batch started
+        assert!(app.implementation.is_none());
+        assert!(app.batch.is_none());
+    }
+
+    #[test]
+    fn test_run_all_enter_navigates_back() {
+        let entries = vec![make_entry("change-a", true, false)];
+        let mut app = make_run_all_app(entries);
+
+        app.handle_run_all_selection_input(KeyCode::Enter);
+
+        assert!(matches!(app.screen, Screen::ChangeList { .. }));
+        assert!(app.screen_stack.is_empty());
+
+        // Clean up
+        app.stop_running_implementation();
+    }
+
+    #[test]
+    fn test_stop_running_implementation_clears_batch() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{mpsc, Arc, Mutex};
+
+        let (_tx, rx) = mpsc::channel();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let cancel_flag_clone = cancel_flag.clone();
+        let existing_impl = crate::runner::ImplState {
+            change_name: "change-a".to_string(),
+            completed: 1,
+            total: 5,
+            log_path: PathBuf::from("/tmp/test.log"),
+            receiver: rx,
+            cancel_flag,
+            child_handle: Arc::new(Mutex::new(None)),
+        };
+
+        let batch = BatchImplState::new(
+            vec![
+                "change-a".to_string(),
+                "change-b".to_string(),
+                "change-c".to_string(),
+            ],
+            HashMap::new(),
+        );
+
+        let mut app = App {
+            screen: Screen::ChangeList {
+                changes: vec![],
+                selected: 0,
+                error: None,
+                tab: ChangeTab::Active,
+                change_deps: HashMap::new(),
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: Some(existing_impl),
+            batch: Some(batch),
+            config: TuiConfig::default(),
+        };
+
+        assert!(app.implementation.is_some());
+        assert!(app.batch.is_some());
+
+        app.stop_running_implementation();
+
+        assert!(app.implementation.is_none());
+        assert!(app.batch.is_none());
+        assert!(cancel_flag_clone.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_stop_running_implementation_no_impl_clears_batch() {
+        // Even without a running implementation, batch state should be cleared
+        let batch = BatchImplState::new(
+            vec!["change-a".to_string()],
+            HashMap::new(),
+        );
+
+        let mut app = App {
+            screen: Screen::ChangeList {
+                changes: vec![],
+                selected: 0,
+                error: None,
+                tab: ChangeTab::Active,
+                change_deps: HashMap::new(),
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: None,
+            batch: Some(batch),
+            config: TuiConfig::default(),
+        };
+
+        app.stop_running_implementation();
+
+        assert!(app.implementation.is_none());
+        assert!(app.batch.is_none());
+    }
+
+    #[test]
+    fn test_stop_running_implementation_no_batch_unchanged() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{mpsc, Arc, Mutex};
+
+        let (_tx, rx) = mpsc::channel();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let existing_impl = crate::runner::ImplState {
+            change_name: "change-a".to_string(),
+            completed: 1,
+            total: 5,
+            log_path: PathBuf::from("/tmp/test.log"),
+            receiver: rx,
+            cancel_flag,
+            child_handle: Arc::new(Mutex::new(None)),
+        };
+
+        let mut app = App {
+            screen: Screen::ChangeList {
+                changes: vec![],
+                selected: 0,
+                error: None,
+                tab: ChangeTab::Active,
+                change_deps: HashMap::new(),
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: Some(existing_impl),
+            batch: None,
+            config: TuiConfig::default(),
+        };
+
+        // Stopping a single run without batch should work fine
+        app.stop_running_implementation();
+        assert!(app.implementation.is_none());
+        assert!(app.batch.is_none());
     }
 }

@@ -1,4 +1,5 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -282,6 +283,324 @@ pub fn discover_specs(change_dir: &Path) -> Vec<SpecItem> {
 
     specs.sort_by(|a, b| a.name.cmp(&b.name));
     specs
+}
+
+/// Configuration for change dependencies, stored in `dependencies.yaml`.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct DependencyConfig {
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+}
+
+/// Read dependencies for a change from its `dependencies.yaml` file.
+///
+/// Returns an empty list if the file does not exist or cannot be parsed.
+pub fn read_dependencies(change_dir: &Path) -> Vec<String> {
+    let path = change_dir.join("dependencies.yaml");
+    let content = match fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let config: DependencyConfig = match serde_yaml::from_str(&content) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    config.depends_on
+}
+
+/// Load dependencies for all given changes.
+///
+/// Returns a map from change name to its dependency list. Changes with no
+/// dependencies are omitted from the map.
+pub fn load_change_dependencies(changes: &[ChangeEntry]) -> HashMap<String, Vec<String>> {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let changes_dir = cwd.join("openspec").join("changes");
+    changes
+        .iter()
+        .filter_map(|c| {
+            let dir = changes_dir.join(&c.name);
+            let deps = read_dependencies(&dir);
+            if deps.is_empty() {
+                None
+            } else {
+                Some((c.name.clone(), deps))
+            }
+        })
+        .collect()
+}
+
+/// Write dependencies for a change to its `dependencies.yaml` file.
+///
+/// Creates or overwrites the file with the given dependency list.
+pub fn write_dependencies(change_dir: &Path, dependencies: &[String]) -> Result<(), String> {
+    let path = change_dir.join("dependencies.yaml");
+    let config = DependencyConfig {
+        depends_on: dependencies.to_vec(),
+    };
+    let yaml = serde_yaml::to_string(&config)
+        .map_err(|e| format!("Failed to serialize dependencies: {e}"))?;
+    fs::write(&path, yaml).map_err(|e| format!("Failed to write {}: {e}", path.display()))
+}
+
+/// Perform a topological sort of changes using Kahn's algorithm.
+///
+/// Takes a map of change names to their dependencies. Returns a `Vec<String>`
+/// in valid execution order (dependencies before dependents), or an `Err`
+/// listing the changes involved in a cycle.
+///
+/// Changes that appear only as dependencies (but are not keys in the map)
+/// are excluded from the output — they are assumed to be already fulfilled.
+pub fn topological_sort(
+    deps: &HashMap<String, Vec<String>>,
+) -> Result<Vec<String>, String> {
+    // Build in-degree map and adjacency list (dependency -> dependents)
+    let mut in_degree: HashMap<&str, usize> = HashMap::new();
+    let mut dependents: HashMap<&str, Vec<&str>> = HashMap::new();
+
+    // Initialize all known changes with zero in-degree
+    for name in deps.keys() {
+        in_degree.entry(name.as_str()).or_insert(0);
+    }
+
+    // Build edges: for each change, each dependency adds an edge dep -> change
+    for (name, dep_list) in deps {
+        for dep in dep_list {
+            // Only count edges from dependencies that are in our change set
+            if deps.contains_key(dep) {
+                *in_degree.entry(name.as_str()).or_insert(0) += 1;
+                dependents
+                    .entry(dep.as_str())
+                    .or_default()
+                    .push(name.as_str());
+            }
+        }
+    }
+
+    // Start with all nodes that have zero in-degree
+    let mut queue: VecDeque<&str> = in_degree
+        .iter()
+        .filter(|(_, deg)| **deg == 0)
+        .map(|(name, _)| *name)
+        .collect();
+
+    // Sort the initial queue for deterministic output
+    let mut sorted_queue: Vec<&str> = queue.drain(..).collect();
+    sorted_queue.sort();
+    queue.extend(sorted_queue);
+
+    let mut result: Vec<String> = Vec::new();
+
+    while let Some(node) = queue.pop_front() {
+        result.push(node.to_string());
+
+        if let Some(deps_of_node) = dependents.get(node) {
+            let mut next: Vec<&str> = Vec::new();
+            for &dependent in deps_of_node {
+                if let Some(deg) = in_degree.get_mut(dependent) {
+                    *deg -= 1;
+                    if *deg == 0 {
+                        next.push(dependent);
+                    }
+                }
+            }
+            // Sort for deterministic output
+            next.sort();
+            queue.extend(next);
+        }
+    }
+
+    if result.len() != deps.len() {
+        // Cycle detected: find which nodes are still unprocessed
+        let processed: HashSet<&str> = result.iter().map(|s| s.as_str()).collect();
+        let cycle_nodes: Vec<String> = deps
+            .keys()
+            .filter(|k| !processed.contains(k.as_str()))
+            .cloned()
+            .collect();
+        Err(format!(
+            "Dependency cycle detected involving: {}",
+            cycle_nodes.join(", ")
+        ))
+    } else {
+        Ok(result)
+    }
+}
+
+/// Strip a date prefix of the form `YYYY-MM-DD-` from a change name.
+///
+/// Returns the remainder after the prefix if the name starts with a valid
+/// date pattern (four digits, dash, two digits, dash, two digits, dash).
+/// Returns `None` if the name doesn't match this pattern.
+fn strip_date_prefix(name: &str) -> Option<&str> {
+    if name.len() > 11 {
+        let bytes = name.as_bytes();
+        if bytes[4] == b'-'
+            && bytes[7] == b'-'
+            && bytes[10] == b'-'
+            && bytes[..4].iter().all(|b| b.is_ascii_digit())
+            && bytes[5..7].iter().all(|b| b.is_ascii_digit())
+            && bytes[8..10].iter().all(|b| b.is_ascii_digit())
+        {
+            return Some(&name[11..]);
+        }
+    }
+    None
+}
+
+/// Resolve fulfilled dependency names from the archive directory.
+///
+/// Scans `archive_dir` for subdirectories and returns a set of change names
+/// that are considered fulfilled. For each archived change, both the full
+/// directory name (e.g., `2026-03-08-add-api`) and the date-stripped suffix
+/// (e.g., `add-api`) are included in the returned set.
+///
+/// Returns an empty set if the directory doesn't exist or can't be read.
+pub fn resolve_archived_dependencies(archive_dir: &Path) -> HashSet<String> {
+    let mut fulfilled = HashSet::new();
+
+    if !archive_dir.exists() {
+        return fulfilled;
+    }
+
+    let entries = match fs::read_dir(archive_dir) {
+        Ok(entries) => entries,
+        Err(_) => return fulfilled,
+    };
+
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+
+        // Add the full name
+        fulfilled.insert(name.clone());
+
+        // Also add the date-stripped suffix if applicable
+        if let Some(stripped) = strip_date_prefix(&name) {
+            fulfilled.insert(stripped.to_string());
+        }
+    }
+
+    fulfilled
+}
+
+/// Check whether a change directory contains a `tasks.md` file.
+///
+/// Used to filter eligible changes for batch runs — only changes with
+/// a `tasks.md` can be executed by the implementation runner.
+pub fn has_tasks_file(change_dir: &Path) -> bool {
+    change_dir.join("tasks.md").is_file()
+}
+
+/// Generate an ASCII dependency graph showing all changes and their relationships.
+///
+/// Produces a multi-line string with tree connectors. Changes with no
+/// dependencies are shown as roots, and dependent changes are shown as
+/// children beneath their dependencies.
+///
+/// Example output:
+/// ```text
+/// add-api
+/// ├── add-auth-layer
+/// │   └── add-permissions
+/// └── add-user-model
+/// standalone-feature
+/// ```
+pub fn generate_dependency_graph(deps: &HashMap<String, Vec<String>>) -> String {
+    // Collect all change names
+    let all_changes: Vec<&String> = {
+        let mut names: Vec<&String> = deps.keys().collect();
+        names.sort();
+        names
+    };
+
+    if all_changes.is_empty() {
+        return "No changes found.".to_string();
+    }
+
+    // Build reverse map: for each change, which changes depend on it (children in graph)
+    let mut children: HashMap<&str, Vec<&str>> = HashMap::new();
+    for name in &all_changes {
+        children.entry(name.as_str()).or_default();
+    }
+    for (name, dep_list) in deps {
+        for dep in dep_list {
+            if deps.contains_key(dep) {
+                children.entry(dep.as_str()).or_default().push(name.as_str());
+            }
+        }
+    }
+    // Sort children for deterministic output
+    for children_list in children.values_mut() {
+        children_list.sort();
+    }
+
+    // Find roots: changes with no dependencies (or only external deps)
+    let roots: Vec<&str> = all_changes
+        .iter()
+        .filter(|name| {
+            deps.get(name.as_str())
+                .map(|d| d.iter().all(|dep| !deps.contains_key(dep)))
+                .unwrap_or(true)
+        })
+        .map(|s| s.as_str())
+        .collect();
+
+    let mut output = String::new();
+    let mut visited: HashSet<&str> = HashSet::new();
+
+    for root in &roots {
+        render_tree_node(root, &children, &mut visited, &mut output, "", "");
+    }
+
+    // Trim trailing newline
+    if output.ends_with('\n') {
+        output.pop();
+    }
+    output
+}
+
+fn render_tree_node<'a>(
+    node: &'a str,
+    children: &HashMap<&str, Vec<&'a str>>,
+    visited: &mut HashSet<&'a str>,
+    output: &mut String,
+    connector: &str,
+    prefix: &str,
+) {
+    if visited.contains(node) {
+        return;
+    }
+    visited.insert(node);
+
+    // Render current node with connector
+    output.push_str(connector);
+    output.push_str(node);
+    output.push('\n');
+
+    // Render children
+    let empty_vec = Vec::new();
+    let node_children = children.get(node).unwrap_or(&empty_vec);
+    let unvisited_children: Vec<&&str> = node_children.iter().filter(|c| !visited.contains(**c)).collect();
+
+    for (i, child) in unvisited_children.iter().enumerate() {
+        let is_last_child = i == unvisited_children.len() - 1;
+        let child_connector = if is_last_child {
+            format!("{}└── ", prefix)
+        } else {
+            format!("{}├── ", prefix)
+        };
+        let child_prefix = if is_last_child {
+            format!("{}    ", prefix)
+        } else {
+            format!("{}│   ", prefix)
+        };
+
+        render_tree_node(child, children, visited, output, &child_connector, &child_prefix);
+    }
 }
 
 #[cfg(test)]
@@ -675,5 +994,497 @@ mod tests {
         let specs = status.artifacts.iter().find(|a| a.id == "specs").unwrap();
         assert_eq!(specs.status, "done");
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // --- read_dependencies / write_dependencies tests ---
+
+    #[test]
+    fn test_read_dependencies_with_deps() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-read-deps");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("dependencies.yaml"),
+            "depends_on:\n  - add-api\n  - add-user-model\n",
+        )
+        .unwrap();
+
+        let deps = read_dependencies(&dir);
+        assert_eq!(deps, vec!["add-api", "add-user-model"]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_read_dependencies_file_missing() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-read-deps-missing");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let deps = read_dependencies(&dir);
+        assert!(deps.is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_read_dependencies_empty_list() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-read-deps-empty");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("dependencies.yaml"), "depends_on: []\n").unwrap();
+
+        let deps = read_dependencies(&dir);
+        assert!(deps.is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_write_dependencies_creates_file() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-write-deps-create");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let deps = vec!["add-api".to_string(), "add-auth".to_string()];
+        write_dependencies(&dir, &deps).unwrap();
+
+        let read_back = read_dependencies(&dir);
+        assert_eq!(read_back, vec!["add-api", "add-auth"]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_write_dependencies_overwrites_existing() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-write-deps-overwrite");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("dependencies.yaml"),
+            "depends_on:\n  - old-dep\n",
+        )
+        .unwrap();
+
+        let deps = vec!["new-dep".to_string()];
+        write_dependencies(&dir, &deps).unwrap();
+
+        let read_back = read_dependencies(&dir);
+        assert_eq!(read_back, vec!["new-dep"]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_write_dependencies_empty_list() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-write-deps-empty");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        write_dependencies(&dir, &[]).unwrap();
+
+        let read_back = read_dependencies(&dir);
+        assert!(read_back.is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_write_then_add_dependency() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-write-add-dep");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // Start with one dep
+        write_dependencies(&dir, &["dep-a".to_string()]).unwrap();
+        // Read, add, write back
+        let mut deps = read_dependencies(&dir);
+        deps.push("dep-b".to_string());
+        write_dependencies(&dir, &deps).unwrap();
+
+        let final_deps = read_dependencies(&dir);
+        assert_eq!(final_deps, vec!["dep-a", "dep-b"]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_write_then_remove_dependency() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-write-remove-dep");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        write_dependencies(&dir, &["dep-a".to_string(), "dep-b".to_string()]).unwrap();
+        // Read, remove, write back
+        let mut deps = read_dependencies(&dir);
+        deps.retain(|d| d != "dep-a");
+        write_dependencies(&dir, &deps).unwrap();
+
+        let final_deps = read_dependencies(&dir);
+        assert_eq!(final_deps, vec!["dep-b"]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // --- topological_sort tests ---
+
+    #[test]
+    fn test_topological_sort_linear_chain() {
+        // A -> B -> C (C depends on B, B depends on A)
+        let mut deps = HashMap::new();
+        deps.insert("a".to_string(), vec![]);
+        deps.insert("b".to_string(), vec!["a".to_string()]);
+        deps.insert("c".to_string(), vec!["b".to_string()]);
+
+        let result = topological_sort(&deps).unwrap();
+        assert_eq!(result, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_topological_sort_multiple_roots() {
+        // A and B are independent, C depends on both
+        let mut deps = HashMap::new();
+        deps.insert("a".to_string(), vec![]);
+        deps.insert("b".to_string(), vec![]);
+        deps.insert("c".to_string(), vec!["a".to_string(), "b".to_string()]);
+
+        let result = topological_sort(&deps).unwrap();
+        // a and b must come before c, order between a and b is alphabetical
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[2], "c");
+        let a_pos = result.iter().position(|x| x == "a").unwrap();
+        let b_pos = result.iter().position(|x| x == "b").unwrap();
+        let c_pos = result.iter().position(|x| x == "c").unwrap();
+        assert!(a_pos < c_pos);
+        assert!(b_pos < c_pos);
+    }
+
+    #[test]
+    fn test_topological_sort_diamond() {
+        // A -> B, A -> C, B -> D, C -> D (diamond shape)
+        let mut deps = HashMap::new();
+        deps.insert("a".to_string(), vec![]);
+        deps.insert("b".to_string(), vec!["a".to_string()]);
+        deps.insert("c".to_string(), vec!["a".to_string()]);
+        deps.insert("d".to_string(), vec!["b".to_string(), "c".to_string()]);
+
+        let result = topological_sort(&deps).unwrap();
+        assert_eq!(result.len(), 4);
+        let a_pos = result.iter().position(|x| x == "a").unwrap();
+        let b_pos = result.iter().position(|x| x == "b").unwrap();
+        let c_pos = result.iter().position(|x| x == "c").unwrap();
+        let d_pos = result.iter().position(|x| x == "d").unwrap();
+        assert!(a_pos < b_pos);
+        assert!(a_pos < c_pos);
+        assert!(b_pos < d_pos);
+        assert!(c_pos < d_pos);
+    }
+
+    #[test]
+    fn test_topological_sort_no_deps() {
+        // All independent
+        let mut deps = HashMap::new();
+        deps.insert("c".to_string(), vec![]);
+        deps.insert("a".to_string(), vec![]);
+        deps.insert("b".to_string(), vec![]);
+
+        let result = topological_sort(&deps).unwrap();
+        // Should be sorted alphabetically since all are roots
+        assert_eq!(result, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_topological_sort_empty() {
+        let deps: HashMap<String, Vec<String>> = HashMap::new();
+        let result = topological_sort(&deps).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_topological_sort_direct_cycle() {
+        // A -> B -> A
+        let mut deps = HashMap::new();
+        deps.insert("a".to_string(), vec!["b".to_string()]);
+        deps.insert("b".to_string(), vec!["a".to_string()]);
+
+        let result = topological_sort(&deps);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("cycle"));
+    }
+
+    #[test]
+    fn test_topological_sort_indirect_cycle() {
+        // A -> B -> C -> A
+        let mut deps = HashMap::new();
+        deps.insert("a".to_string(), vec!["c".to_string()]);
+        deps.insert("b".to_string(), vec!["a".to_string()]);
+        deps.insert("c".to_string(), vec!["b".to_string()]);
+
+        let result = topological_sort(&deps);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("cycle"));
+    }
+
+    #[test]
+    fn test_topological_sort_external_dep_ignored() {
+        // B depends on "external" which is not in the map
+        let mut deps = HashMap::new();
+        deps.insert("a".to_string(), vec![]);
+        deps.insert(
+            "b".to_string(),
+            vec!["a".to_string(), "external".to_string()],
+        );
+
+        let result = topological_sort(&deps).unwrap();
+        assert_eq!(result, vec!["a", "b"]);
+    }
+
+    // --- resolve_archived_dependencies tests ---
+
+    #[test]
+    fn test_resolve_archived_exact_match() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-archived-exact");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("add-api")).unwrap();
+        fs::create_dir_all(dir.join("add-auth")).unwrap();
+
+        let result = resolve_archived_dependencies(&dir);
+        assert!(result.contains("add-api"));
+        assert!(result.contains("add-auth"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_resolve_archived_date_prefix_match() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-archived-dateprefix");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("2026-03-08-add-api")).unwrap();
+
+        let result = resolve_archived_dependencies(&dir);
+        // Both the full name and the stripped name should be present
+        assert!(result.contains("2026-03-08-add-api"));
+        assert!(result.contains("add-api"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_resolve_archived_no_match() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-archived-nomatch");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // Empty archive directory
+
+        let result = resolve_archived_dependencies(&dir);
+        assert!(result.is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_resolve_archived_nonexistent_directory() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-archived-nonexistent-dir");
+        let _ = fs::remove_dir_all(&dir);
+
+        let result = resolve_archived_dependencies(&dir);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_archived_ignores_files() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-archived-ignores-files");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("not-a-dir.txt"), "file").unwrap();
+        fs::create_dir_all(dir.join("real-change")).unwrap();
+
+        let result = resolve_archived_dependencies(&dir);
+        assert!(result.contains("real-change"));
+        assert!(!result.contains("not-a-dir.txt"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_resolve_archived_mixed_names() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-archived-mixed");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("2026-03-06-foo")).unwrap();
+        fs::create_dir_all(dir.join("bar-no-date")).unwrap();
+
+        let result = resolve_archived_dependencies(&dir);
+        assert!(result.contains("2026-03-06-foo"));
+        assert!(result.contains("foo")); // date-stripped
+        assert!(result.contains("bar-no-date"));
+        assert_eq!(result.len(), 3); // 2026-03-06-foo, foo, bar-no-date
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // --- strip_date_prefix tests ---
+
+    #[test]
+    fn test_strip_date_prefix_valid() {
+        assert_eq!(strip_date_prefix("2026-03-08-add-api"), Some("add-api"));
+    }
+
+    #[test]
+    fn test_strip_date_prefix_no_prefix() {
+        assert_eq!(strip_date_prefix("add-api"), None);
+    }
+
+    #[test]
+    fn test_strip_date_prefix_too_short() {
+        assert_eq!(strip_date_prefix("2026-03-08"), None);
+    }
+
+    #[test]
+    fn test_strip_date_prefix_invalid_format() {
+        assert_eq!(strip_date_prefix("not-a-date-prefix"), None);
+    }
+
+    // --- has_tasks_file tests ---
+
+    #[test]
+    fn test_has_tasks_file_exists() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-has-tasks-exists");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("tasks.md"), "- [ ] Task one\n").unwrap();
+
+        assert!(has_tasks_file(&dir));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_has_tasks_file_missing() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-has-tasks-missing");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        assert!(!has_tasks_file(&dir));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_has_tasks_file_is_directory() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-has-tasks-isdir");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("tasks.md")).unwrap();
+
+        assert!(!has_tasks_file(&dir));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_has_tasks_file_nonexistent_dir() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-has-tasks-nodir");
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(!has_tasks_file(&dir));
+    }
+
+    #[test]
+    fn test_load_change_dependencies_with_deps() {
+        let base = std::env::temp_dir().join("openspec-tui-test-load-deps");
+        let _ = fs::remove_dir_all(&base);
+        let changes_dir = base.join("openspec").join("changes");
+
+        // Create two change dirs, one with deps, one without
+        let change_a = changes_dir.join("change-a");
+        let change_b = changes_dir.join("change-b");
+        fs::create_dir_all(&change_a).unwrap();
+        fs::create_dir_all(&change_b).unwrap();
+
+        fs::write(
+            change_a.join("dependencies.yaml"),
+            "depends_on:\n  - change-b\n",
+        )
+        .unwrap();
+
+        let changes = vec![
+            ChangeEntry {
+                name: "change-a".to_string(),
+                completed_tasks: 0,
+                total_tasks: 1,
+                status: "in-progress".to_string(),
+            },
+            ChangeEntry {
+                name: "change-b".to_string(),
+                completed_tasks: 0,
+                total_tasks: 1,
+                status: "in-progress".to_string(),
+            },
+        ];
+
+        // Use the function directly with the right cwd
+        // Since load_change_dependencies uses current_dir, we test read_dependencies directly
+        let deps_a = read_dependencies(&change_a);
+        assert_eq!(deps_a, vec!["change-b".to_string()]);
+
+        let deps_b = read_dependencies(&change_b);
+        assert!(deps_b.is_empty());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_generate_dependency_graph_linear_chain() {
+        let mut deps = HashMap::new();
+        deps.insert("a".to_string(), vec![]);
+        deps.insert("b".to_string(), vec!["a".to_string()]);
+        deps.insert("c".to_string(), vec!["b".to_string()]);
+
+        let graph = generate_dependency_graph(&deps);
+        assert_eq!(graph, "a\n└── b\n    └── c");
+    }
+
+    #[test]
+    fn test_generate_dependency_graph_diamond() {
+        let mut deps = HashMap::new();
+        deps.insert("a".to_string(), vec![]);
+        deps.insert("b".to_string(), vec!["a".to_string()]);
+        deps.insert("c".to_string(), vec!["a".to_string()]);
+        deps.insert("d".to_string(), vec!["b".to_string(), "c".to_string()]);
+
+        let graph = generate_dependency_graph(&deps);
+        // a is root, b and c are children of a, d is child of b (visited first)
+        assert!(graph.contains("a"));
+        assert!(graph.contains("b"));
+        assert!(graph.contains("c"));
+        assert!(graph.contains("d"));
+        // d should appear as child of b or c (whichever is visited first)
+        // Since b comes before c alphabetically, d should be under b
+        let lines: Vec<&str> = graph.lines().collect();
+        assert_eq!(lines[0], "a");
+    }
+
+    #[test]
+    fn test_generate_dependency_graph_no_deps() {
+        let mut deps = HashMap::new();
+        deps.insert("alpha".to_string(), vec![]);
+        deps.insert("beta".to_string(), vec![]);
+        deps.insert("gamma".to_string(), vec![]);
+
+        let graph = generate_dependency_graph(&deps);
+        let lines: Vec<&str> = graph.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "alpha");
+        assert_eq!(lines[1], "beta");
+        assert_eq!(lines[2], "gamma");
+    }
+
+    #[test]
+    fn test_generate_dependency_graph_multiple_roots() {
+        let mut deps = HashMap::new();
+        deps.insert("api".to_string(), vec![]);
+        deps.insert("db".to_string(), vec![]);
+        deps.insert("service".to_string(), vec!["api".to_string(), "db".to_string()]);
+
+        let graph = generate_dependency_graph(&deps);
+        assert!(graph.contains("api"));
+        assert!(graph.contains("db"));
+        assert!(graph.contains("service"));
+        // service should be a child of one of the roots
+        let lines: Vec<&str> = graph.lines().collect();
+        // api and db are roots (alphabetically api first)
+        assert_eq!(lines[0], "api");
+    }
+
+    #[test]
+    fn test_generate_dependency_graph_empty() {
+        let deps = HashMap::new();
+        let graph = generate_dependency_graph(&deps);
+        assert_eq!(graph, "No changes found.");
     }
 }

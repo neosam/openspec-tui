@@ -131,6 +131,18 @@ fn run_app(terminal: &mut ratatui::Terminal<CrosstermBackend<io::Stdout>>) -> Re
                     Screen::ArtifactView { .. } => {
                         app.handle_artifact_view_input(key.code);
                     }
+                    Screen::DependencyView { .. } => {
+                        app.handle_dependency_view_input(key.code);
+                    }
+                    Screen::DependencyAdd { .. } => {
+                        app.handle_dependency_add_input(key.code);
+                    }
+                    Screen::DependencyGraph { .. } => {
+                        app.handle_dependency_graph_input(key.code);
+                    }
+                    Screen::RunAllSelection { .. } => {
+                        app.handle_run_all_selection_input(key.code);
+                    }
                     Screen::Config { .. } => {
                         // Handled above
                     }

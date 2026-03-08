@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
@@ -24,6 +25,110 @@ pub struct ImplState {
     pub receiver: Receiver<ImplUpdate>,
     pub cancel_flag: Arc<AtomicBool>,
     pub child_handle: Arc<Mutex<Option<Child>>>,
+}
+
+/// State for a batch implementation run across multiple changes.
+///
+/// Tracks which changes to run (in topological order), the current position,
+/// and which changes have completed, failed, or been skipped.
+pub struct BatchImplState {
+    /// Topologically sorted change names to execute.
+    pub queue: Vec<String>,
+    /// Index of the currently running change in `queue`.
+    pub current_index: usize,
+    /// Changes that completed successfully.
+    pub completed: HashSet<String>,
+    /// Changes that failed during execution.
+    pub failed: HashSet<String>,
+    /// Changes skipped because a dependency failed or was skipped.
+    pub skipped: HashSet<String>,
+    /// Map of change name to its dependencies (used for failure propagation).
+    pub deps: HashMap<String, Vec<String>>,
+}
+
+impl BatchImplState {
+    /// Create a new batch state from a topologically sorted queue and their dependencies.
+    pub fn new(queue: Vec<String>, deps: HashMap<String, Vec<String>>) -> Self {
+        Self {
+            queue,
+            current_index: 0,
+            completed: HashSet::new(),
+            failed: HashSet::new(),
+            skipped: HashSet::new(),
+            deps,
+        }
+    }
+
+    /// Returns the name of the currently running change, if any.
+    pub fn current_change(&self) -> Option<&str> {
+        self.queue.get(self.current_index).map(|s| s.as_str())
+    }
+
+    /// Returns true if the batch has finished (all changes processed).
+    pub fn is_finished(&self) -> bool {
+        self.current_index >= self.queue.len()
+    }
+
+    /// Returns the total number of changes in the batch.
+    pub fn total(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// Check whether a change should be skipped because one of its
+    /// dependencies (transitively) has failed or been skipped.
+    pub fn should_skip(&self, change_name: &str) -> bool {
+        let mut visited = HashSet::new();
+        self.has_failed_dependency(change_name, &mut visited)
+    }
+
+    fn has_failed_dependency(&self, change_name: &str, visited: &mut HashSet<String>) -> bool {
+        if !visited.insert(change_name.to_string()) {
+            return false;
+        }
+        if let Some(dep_list) = self.deps.get(change_name) {
+            for dep in dep_list {
+                if self.failed.contains(dep) || self.skipped.contains(dep) {
+                    return true;
+                }
+                if self.has_failed_dependency(dep, visited) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Advance to the next change after the current one has finished or failed.
+    ///
+    /// - If `success` is true, the current change is added to `completed`.
+    /// - If `success` is false, the current change is added to `failed`.
+    ///
+    /// Then advances `current_index`, skipping any changes whose dependencies
+    /// have failed. Returns the name of the next change to run, or `None` if
+    /// the batch is finished.
+    pub fn advance(&mut self, success: bool) -> Option<String> {
+        if let Some(current) = self.queue.get(self.current_index).cloned() {
+            if success {
+                self.completed.insert(current);
+            } else {
+                self.failed.insert(current);
+            }
+        }
+        self.current_index += 1;
+
+        // Skip changes whose dependencies failed
+        while self.current_index < self.queue.len() {
+            let name = &self.queue[self.current_index];
+            if self.should_skip(name) {
+                self.skipped.insert(name.clone());
+                self.current_index += 1;
+            } else {
+                break;
+            }
+        }
+
+        self.queue.get(self.current_index).cloned()
+    }
 }
 
 /// Stop a running implementation by setting the cancel flag and killing the
@@ -829,5 +934,148 @@ mod tests {
         assert!(matches!(msg, ImplUpdate::Finished));
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // --- BatchImplState tests ---
+
+    #[test]
+    fn test_batch_impl_state_new() {
+        let queue = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let deps = HashMap::new();
+        let state = BatchImplState::new(queue.clone(), deps);
+
+        assert_eq!(state.queue, queue);
+        assert_eq!(state.current_index, 0);
+        assert!(state.completed.is_empty());
+        assert!(state.failed.is_empty());
+        assert!(state.skipped.is_empty());
+    }
+
+    #[test]
+    fn test_batch_current_change() {
+        let queue = vec!["a".to_string(), "b".to_string()];
+        let state = BatchImplState::new(queue, HashMap::new());
+
+        assert_eq!(state.current_change(), Some("a"));
+        assert!(!state.is_finished());
+    }
+
+    #[test]
+    fn test_batch_current_change_empty_queue() {
+        let state = BatchImplState::new(vec![], HashMap::new());
+
+        assert_eq!(state.current_change(), None);
+        assert!(state.is_finished());
+    }
+
+    #[test]
+    fn test_batch_total() {
+        let queue = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let state = BatchImplState::new(queue, HashMap::new());
+
+        assert_eq!(state.total(), 3);
+    }
+
+    #[test]
+    fn test_batch_advance_success() {
+        let queue = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let mut state = BatchImplState::new(queue, HashMap::new());
+
+        let next = state.advance(true);
+        assert_eq!(next, Some("b".to_string()));
+        assert!(state.completed.contains("a"));
+        assert_eq!(state.current_index, 1);
+
+        let next = state.advance(true);
+        assert_eq!(next, Some("c".to_string()));
+        assert!(state.completed.contains("b"));
+
+        let next = state.advance(true);
+        assert_eq!(next, None);
+        assert!(state.completed.contains("c"));
+        assert!(state.is_finished());
+    }
+
+    #[test]
+    fn test_batch_advance_failure_skips_dependents() {
+        // Queue: a -> b -> c (b depends on a, c depends on b)
+        let queue = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let mut deps = HashMap::new();
+        deps.insert("b".to_string(), vec!["a".to_string()]);
+        deps.insert("c".to_string(), vec!["b".to_string()]);
+        let mut state = BatchImplState::new(queue, deps);
+
+        // "a" fails
+        let next = state.advance(false);
+        // "b" and "c" should be skipped, no next change
+        assert_eq!(next, None);
+        assert!(state.failed.contains("a"));
+        assert!(state.skipped.contains("b"));
+        assert!(state.skipped.contains("c"));
+        assert!(state.is_finished());
+    }
+
+    #[test]
+    fn test_batch_advance_failure_continues_independent() {
+        // Queue: a, b (independent), c depends on a
+        let queue = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let mut deps = HashMap::new();
+        deps.insert("c".to_string(), vec!["a".to_string()]);
+        let mut state = BatchImplState::new(queue, deps);
+
+        // "a" fails
+        let next = state.advance(false);
+        // "b" is independent, should be the next
+        assert_eq!(next, Some("b".to_string()));
+        assert!(state.failed.contains("a"));
+
+        // "b" succeeds
+        let next = state.advance(true);
+        // "c" depends on "a" which failed, so "c" is skipped
+        assert_eq!(next, None);
+        assert!(state.completed.contains("b"));
+        assert!(state.skipped.contains("c"));
+    }
+
+    #[test]
+    fn test_batch_should_skip_transitive() {
+        // a -> b -> c: if a fails, both b and c should be skipped
+        let mut deps = HashMap::new();
+        deps.insert("b".to_string(), vec!["a".to_string()]);
+        deps.insert("c".to_string(), vec!["b".to_string()]);
+        let mut state = BatchImplState::new(vec![], deps);
+
+        state.failed.insert("a".to_string());
+        assert!(state.should_skip("b"));
+        assert!(state.should_skip("c"));
+    }
+
+    #[test]
+    fn test_batch_should_skip_no_failed_deps() {
+        let mut deps = HashMap::new();
+        deps.insert("b".to_string(), vec!["a".to_string()]);
+        let state = BatchImplState::new(vec![], deps);
+
+        assert!(!state.should_skip("b"));
+    }
+
+    #[test]
+    fn test_batch_all_complete_finishes() {
+        let queue = vec!["x".to_string()];
+        let mut state = BatchImplState::new(queue, HashMap::new());
+
+        let next = state.advance(true);
+        assert_eq!(next, None);
+        assert!(state.is_finished());
+        assert!(state.completed.contains("x"));
+    }
+
+    #[test]
+    fn test_batch_deps_stored() {
+        let mut deps = HashMap::new();
+        deps.insert("b".to_string(), vec!["a".to_string()]);
+        let state = BatchImplState::new(vec!["a".to_string(), "b".to_string()], deps.clone());
+
+        assert_eq!(state.deps, deps);
     }
 }
