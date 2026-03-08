@@ -41,21 +41,24 @@ pub fn draw(frame: &mut Frame, app: &App) {
             content,
             scroll,
             is_plain_text,
+            ..
         } => draw_artifact_view(frame, title, content, *scroll, *is_plain_text, content_area),
         Screen::Config {
             command,
             prompt,
             post_implementation_prompt,
+            interactive_command,
             cursor_position,
             focused_field,
             editing,
-        } => draw_config_screen(frame, command, prompt, post_implementation_prompt, *cursor_position, focused_field, *editing, content_area),
+        } => draw_config_screen(frame, command, prompt, post_implementation_prompt, interactive_command, *cursor_position, focused_field, *editing, content_area),
         Screen::DependencyView {
             change_name,
             dependencies,
             selected,
+            run_mode,
             ..
-        } => draw_dependency_view(frame, change_name, dependencies, *selected, content_area),
+        } => draw_dependency_view(frame, change_name, dependencies, *selected, run_mode, content_area),
         Screen::DependencyAdd {
             change_name,
             available_changes,
@@ -188,13 +191,18 @@ fn draw_change_list(
         })
         .collect();
 
+    let mut bottom_hints = vec![
+        Span::styled(" [C] Config ", Style::default().fg(Color::DarkGray)),
+    ];
+    if *tab == ChangeTab::Active {
+        bottom_hints.push(Span::styled("[I] Interactive ", Style::default().fg(Color::DarkGray)));
+    }
+    bottom_hints.push(Span::styled("[q] Quit ", Style::default().fg(Color::DarkGray)));
+
     let list = List::new(items).block(
         Block::default()
             .title(title)
-            .title_bottom(Line::from(vec![
-                Span::styled(" [C] Config ", Style::default().fg(Color::DarkGray)),
-                Span::styled("[q] Quit ", Style::default().fg(Color::DarkGray)),
-            ]))
+            .title_bottom(Line::from(bottom_hints))
             .borders(Borders::ALL),
     );
     frame.render_widget(list, area);
@@ -280,6 +288,7 @@ pub fn draw_config_screen(
     command: &str,
     prompt: &str,
     post_implementation_prompt: &str,
+    interactive_command: &str,
     cursor_position: usize,
     focused_field: &ConfigField,
     editing: bool,
@@ -289,6 +298,7 @@ pub fn draw_config_screen(
         Constraint::Length(3), // Command field
         Constraint::Min(3),   // Prompt preview
         Constraint::Length(3), // Post-implementation prompt
+        Constraint::Length(3), // Interactive command
         Constraint::Length(1), // Keybinding hints
     ])
     .split(area);
@@ -381,6 +391,42 @@ pub fn draw_config_screen(
         .block(post_prompt_block);
     frame.render_widget(post_prompt_paragraph, chunks[2]);
 
+    // Interactive command field
+    let interactive_style = if *focused_field == ConfigField::InteractiveCommand {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let interactive_block = Block::default()
+        .title(" Interactive Command ")
+        .borders(Borders::ALL)
+        .border_style(interactive_style);
+
+    let interactive_text = if editing && *focused_field == ConfigField::InteractiveCommand {
+        let before = &interactive_command[..cursor_position];
+        let cursor_char = interactive_command.get(cursor_position..cursor_position + 1).unwrap_or(" ");
+        let after = if cursor_position < interactive_command.len() {
+            &interactive_command[cursor_position + 1..]
+        } else {
+            ""
+        };
+        Line::from(vec![
+            Span::raw(before),
+            Span::styled(
+                cursor_char,
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::White),
+            ),
+            Span::raw(after),
+        ])
+    } else {
+        Line::from(interactive_command)
+    };
+
+    let interactive_paragraph = Paragraph::new(interactive_text).block(interactive_block);
+    frame.render_widget(interactive_paragraph, chunks[3]);
+
     // Warning if {prompt} is missing from command
     let has_prompt_placeholder = command.contains("{prompt}");
 
@@ -408,7 +454,7 @@ pub fn draw_config_screen(
 
     let hints_line = Line::from(hints);
     let hints_paragraph = Paragraph::new(hints_line);
-    frame.render_widget(hints_paragraph, chunks[3]);
+    frame.render_widget(hints_paragraph, chunks[4]);
 }
 
 pub fn draw_dependency_view(
@@ -416,16 +462,24 @@ pub fn draw_dependency_view(
     change_name: &str,
     dependencies: &[String],
     selected: usize,
+    run_mode: &crate::data::RunMode,
     area: Rect,
 ) {
+    let mode_label = match run_mode {
+        crate::data::RunMode::Normal => "Normal",
+        crate::data::RunMode::Apply => "Apply",
+    };
+    let title = format!(" {} - Config  [Mode: {}] ", change_name, mode_label);
+
     if dependencies.is_empty() {
         let paragraph = Paragraph::new("No dependencies configured.")
             .style(Style::default().fg(Color::DarkGray))
             .block(
                 Block::default()
-                    .title(format!(" {} - Dependencies ", change_name))
+                    .title(title)
                     .title_bottom(Line::from(vec![
                         Span::styled(" [A] Add ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("[M] Toggle Mode ", Style::default().fg(Color::DarkGray)),
                         Span::styled("[Esc] Back ", Style::default().fg(Color::DarkGray)),
                     ]))
                     .borders(Borders::ALL),
@@ -455,10 +509,11 @@ pub fn draw_dependency_view(
 
     let list = List::new(items).block(
         Block::default()
-            .title(format!(" {} - Dependencies ", change_name))
+            .title(title)
             .title_bottom(Line::from(vec![
                 Span::styled(" [A] Add ", Style::default().fg(Color::DarkGray)),
                 Span::styled("[D] Remove ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[M] Toggle Mode ", Style::default().fg(Color::DarkGray)),
                 Span::styled("[Esc] Back ", Style::default().fg(Color::DarkGray)),
             ]))
             .borders(Borders::ALL),
@@ -1072,6 +1127,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: Some(make_impl_state("my-change", 2, 5)),
             batch: None,
             config: crate::config::TuiConfig::default(),
@@ -1102,6 +1158,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: None,
             config: crate::config::TuiConfig::default(),
@@ -1267,7 +1324,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                draw_config_screen(frame, command, prompt, "", cursor_position, focused_field, editing, area);
+                draw_config_screen(frame, command, prompt, "", "claude", cursor_position, focused_field, editing, area);
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -1340,12 +1397,14 @@ mod tests {
                 command: "claude --print {prompt}".to_string(),
                 prompt: "implement {name}".to_string(),
                 post_implementation_prompt: String::new(),
+                interactive_command: "claude".to_string(),
                 cursor_position: 0,
                 focused_field: ConfigField::Command,
                 editing: false,
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: None,
             config: crate::config::TuiConfig::default(),
@@ -1364,7 +1423,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                draw_config_screen(frame, "cmd {prompt}", "prompt", "", 0, &ConfigField::Command, false, area);
+                draw_config_screen(frame, "cmd {prompt}", "prompt", "", "claude", 0, &ConfigField::Command, false, area);
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -1386,7 +1445,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                draw_config_screen(frame, "cmd {prompt}", "prompt", "", 0, &ConfigField::Command, true, area);
+                draw_config_screen(frame, "cmd {prompt}", "prompt", "", "claude", 0, &ConfigField::Command, true, area);
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -1447,7 +1506,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                draw_config_screen(frame, "cmd {prompt}", "prompt", "commit changes", 0, &ConfigField::Command, false, area);
+                draw_config_screen(frame, "cmd {prompt}", "prompt", "commit changes", "claude", 0, &ConfigField::Command, false, area);
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -1471,7 +1530,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                draw_config_screen(frame, "cmd {prompt}", "prompt", "", 0, &ConfigField::Command, false, area);
+                draw_config_screen(frame, "cmd {prompt}", "prompt", "", "claude", 0, &ConfigField::Command, false, area);
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -1494,7 +1553,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                draw_config_screen(frame, "cmd {prompt}", "prompt", "", 0, &ConfigField::PostImplementationPrompt, false, area);
+                draw_config_screen(frame, "cmd {prompt}", "prompt", "", "claude", 0, &ConfigField::PostImplementationPrompt, false, area);
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -1518,7 +1577,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                draw_dependency_view(frame, "test-change", deps, selected, area);
+                draw_dependency_view(frame, "test-change", deps, selected, &crate::data::RunMode::Normal, area);
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -1536,9 +1595,10 @@ mod tests {
     #[test]
     fn test_dependency_view_shows_title() {
         let deps = vec!["dep-a".to_string()];
-        let rendered = render_dependency_view(50, 6, &deps, 0);
+        let rendered = render_dependency_view(60, 6, &deps, 0);
         assert!(rendered.contains("test-change"), "Change name should be in title");
-        assert!(rendered.contains("Dependencies"), "Dependencies label should be in title");
+        assert!(rendered.contains("Config"), "Config label should be in title");
+        assert!(rendered.contains("Mode: Normal"), "Run mode should be in title");
     }
 
     #[test]
@@ -1559,9 +1619,10 @@ mod tests {
     #[test]
     fn test_dependency_view_shows_keybinding_hints() {
         let deps = vec!["dep-a".to_string()];
-        let rendered = render_dependency_view(60, 6, &deps, 0);
+        let rendered = render_dependency_view(80, 6, &deps, 0);
         assert!(rendered.contains("[A] Add"), "Add hint should be visible");
         assert!(rendered.contains("[D] Remove"), "Remove hint should be visible");
+        assert!(rendered.contains("[M] Toggle Mode"), "Toggle Mode hint should be visible");
         assert!(rendered.contains("[Esc] Back"), "Back hint should be visible");
     }
 
@@ -1573,7 +1634,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                draw_dependency_view(frame, "test-change", &deps, 1, area);
+                draw_dependency_view(frame, "test-change", &deps, 1, &crate::data::RunMode::Normal, area);
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -1927,5 +1988,78 @@ mod tests {
             rendered.contains("No eligible changes"),
             "Should show empty message"
         );
+    }
+
+    #[test]
+    fn test_config_screen_shows_interactive_command_field() {
+        let backend = TestBackend::new(80, 25);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_config_screen(frame, "cmd {prompt}", "prompt", "", "aider --model gpt4", 0, &ConfigField::Command, false, area);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut lines = Vec::new();
+        for y in 0..25u16 {
+            let mut line = String::new();
+            for x in 0..80u16 {
+                line.push_str(buffer.cell((x, y)).unwrap().symbol());
+            }
+            lines.push(line.trim_end().to_string());
+        }
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("Interactive Command"), "Interactive Command field should be visible");
+        assert!(rendered.contains("aider --model gpt4"), "Interactive command value should be visible");
+    }
+
+    #[test]
+    fn test_change_list_shows_interactive_hint_on_active_tab() {
+        let app = crate::app::App {
+            screen: crate::app::Screen::ChangeList {
+                changes: vec![crate::data::ChangeEntry {
+                    name: "test-change".to_string(),
+                    completed_tasks: 1,
+                    total_tasks: 3,
+                    status: "in-progress".to_string(),
+                }],
+                selected: 0,
+                error: None,
+                tab: crate::app::ChangeTab::Active,
+                change_deps: std::collections::HashMap::new(),
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            launch_interactive: false,
+            implementation: None,
+            batch: None,
+            config: crate::config::TuiConfig::default(),
+            config_path: std::path::PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
+        };
+        let rendered = render_draw(80, 10, &app);
+        assert!(rendered.contains("[I] Interactive"), "Active tab should show [I] Interactive hint");
+    }
+
+    #[test]
+    fn test_change_list_hides_interactive_hint_on_archived_tab() {
+        let app = crate::app::App {
+            screen: crate::app::Screen::ChangeList {
+                changes: vec![],
+                selected: 0,
+                error: None,
+                tab: crate::app::ChangeTab::Archived,
+                change_deps: std::collections::HashMap::new(),
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            launch_interactive: false,
+            implementation: None,
+            batch: None,
+            config: crate::config::TuiConfig::default(),
+            config_path: std::path::PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
+        };
+        let rendered = render_draw(80, 10, &app);
+        assert!(!rendered.contains("[I] Interactive"), "Archived tab should not show [I] Interactive hint");
     }
 }

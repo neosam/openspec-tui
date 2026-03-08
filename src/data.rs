@@ -285,27 +285,51 @@ pub fn discover_specs(change_dir: &Path) -> Vec<SpecItem> {
     specs
 }
 
-/// Configuration for change dependencies, stored in `dependencies.yaml`.
-#[derive(Debug, Deserialize, Serialize, Clone, Default)]
-pub struct DependencyConfig {
-    #[serde(default)]
-    pub depends_on: Vec<String>,
+/// Run mode for a change's implementation.
+#[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum RunMode {
+    #[default]
+    Normal,
+    Apply,
 }
 
-/// Read dependencies for a change from its `dependencies.yaml` file.
+/// Per-change configuration, stored in `change-config.yaml`.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct ChangeConfig {
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    #[serde(default)]
+    pub run_mode: RunMode,
+}
+
+/// Read the full change config from `change-config.yaml`.
+///
+/// Returns default config if the file does not exist or cannot be parsed.
+pub fn read_change_config(change_dir: &Path) -> ChangeConfig {
+    let path = change_dir.join("change-config.yaml");
+    let content = match fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return ChangeConfig::default(),
+    };
+    match serde_yaml::from_str(&content) {
+        Ok(c) => c,
+        Err(_) => ChangeConfig::default(),
+    }
+}
+
+/// Read dependencies for a change from its `change-config.yaml` file.
 ///
 /// Returns an empty list if the file does not exist or cannot be parsed.
 pub fn read_dependencies(change_dir: &Path) -> Vec<String> {
-    let path = change_dir.join("dependencies.yaml");
-    let content = match fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
-    let config: DependencyConfig = match serde_yaml::from_str(&content) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
-    config.depends_on
+    read_change_config(change_dir).depends_on
+}
+
+/// Read the run mode for a change from its `change-config.yaml` file.
+///
+/// Returns `RunMode::Normal` if the file does not exist or cannot be parsed.
+pub fn read_run_mode(change_dir: &Path) -> RunMode {
+    read_change_config(change_dir).run_mode
 }
 
 /// Load dependencies for all given changes.
@@ -329,17 +353,23 @@ pub fn load_change_dependencies(changes: &[ChangeEntry]) -> HashMap<String, Vec<
         .collect()
 }
 
-/// Write dependencies for a change to its `dependencies.yaml` file.
+/// Write the full change config to `change-config.yaml`.
 ///
-/// Creates or overwrites the file with the given dependency list.
-pub fn write_dependencies(change_dir: &Path, dependencies: &[String]) -> Result<(), String> {
-    let path = change_dir.join("dependencies.yaml");
-    let config = DependencyConfig {
-        depends_on: dependencies.to_vec(),
-    };
-    let yaml = serde_yaml::to_string(&config)
-        .map_err(|e| format!("Failed to serialize dependencies: {e}"))?;
+/// Creates or overwrites the file.
+pub fn write_change_config(change_dir: &Path, config: &ChangeConfig) -> Result<(), String> {
+    let path = change_dir.join("change-config.yaml");
+    let yaml = serde_yaml::to_string(config)
+        .map_err(|e| format!("Failed to serialize change config: {e}"))?;
     fs::write(&path, yaml).map_err(|e| format!("Failed to write {}: {e}", path.display()))
+}
+
+/// Write dependencies for a change to its `change-config.yaml` file.
+///
+/// Reads existing config first to preserve other fields (like run_mode).
+pub fn write_dependencies(change_dir: &Path, dependencies: &[String]) -> Result<(), String> {
+    let mut config = read_change_config(change_dir);
+    config.depends_on = dependencies.to_vec();
+    write_change_config(change_dir, &config)
 }
 
 /// Perform a topological sort of changes using Kahn's algorithm.
@@ -1004,7 +1034,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         fs::write(
-            dir.join("dependencies.yaml"),
+            dir.join("change-config.yaml"),
             "depends_on:\n  - add-api\n  - add-user-model\n",
         )
         .unwrap();
@@ -1030,7 +1060,7 @@ mod tests {
         let dir = std::env::temp_dir().join("openspec-tui-test-read-deps-empty");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("dependencies.yaml"), "depends_on: []\n").unwrap();
+        fs::write(dir.join("change-config.yaml"), "depends_on: []\n").unwrap();
 
         let deps = read_dependencies(&dir);
         assert!(deps.is_empty());
@@ -1057,7 +1087,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         fs::write(
-            dir.join("dependencies.yaml"),
+            dir.join("change-config.yaml"),
             "depends_on:\n  - old-dep\n",
         )
         .unwrap();
@@ -1387,7 +1417,7 @@ mod tests {
         fs::create_dir_all(&change_b).unwrap();
 
         fs::write(
-            change_a.join("dependencies.yaml"),
+            change_a.join("change-config.yaml"),
             "depends_on:\n  - change-b\n",
         )
         .unwrap();
@@ -1486,5 +1516,136 @@ mod tests {
         let deps = HashMap::new();
         let graph = generate_dependency_graph(&deps);
         assert_eq!(graph, "No changes found.");
+    }
+
+    // --- RunMode / ChangeConfig tests ---
+
+    #[test]
+    fn test_run_mode_default_is_normal() {
+        let mode = RunMode::default();
+        assert_eq!(mode, RunMode::Normal);
+    }
+
+    #[test]
+    fn test_change_config_missing_run_mode_defaults_to_normal() {
+        let yaml = "depends_on:\n  - dep-a\n";
+        let config: ChangeConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.run_mode, RunMode::Normal);
+        assert_eq!(config.depends_on, vec!["dep-a"]);
+    }
+
+    #[test]
+    fn test_change_config_explicit_apply_mode() {
+        let yaml = "depends_on: []\nrun_mode: apply\n";
+        let config: ChangeConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.run_mode, RunMode::Apply);
+    }
+
+    #[test]
+    fn test_change_config_explicit_normal_mode() {
+        let yaml = "run_mode: normal\n";
+        let config: ChangeConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.run_mode, RunMode::Normal);
+    }
+
+    #[test]
+    fn test_change_config_empty_yaml_defaults() {
+        let yaml = "{}";
+        let config: ChangeConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.run_mode, RunMode::Normal);
+        assert!(config.depends_on.is_empty());
+    }
+
+    #[test]
+    fn test_change_config_roundtrip_serialization() {
+        let config = ChangeConfig {
+            depends_on: vec!["dep-a".to_string(), "dep-b".to_string()],
+            run_mode: RunMode::Apply,
+        };
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        let deserialized: ChangeConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(deserialized.depends_on, config.depends_on);
+        assert_eq!(deserialized.run_mode, RunMode::Apply);
+    }
+
+    #[test]
+    fn test_read_change_config_with_run_mode() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-read-config-runmode");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("change-config.yaml"),
+            "depends_on:\n  - dep-a\nrun_mode: apply\n",
+        )
+        .unwrap();
+
+        let config = read_change_config(&dir);
+        assert_eq!(config.depends_on, vec!["dep-a"]);
+        assert_eq!(config.run_mode, RunMode::Apply);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_read_run_mode_default() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-read-runmode-default");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let mode = read_run_mode(&dir);
+        assert_eq!(mode, RunMode::Normal);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_read_run_mode_apply() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-read-runmode-apply");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("change-config.yaml"), "run_mode: apply\n").unwrap();
+
+        let mode = read_run_mode(&dir);
+        assert_eq!(mode, RunMode::Apply);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_write_change_config_preserves_run_mode() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-write-config-runmode");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let config = ChangeConfig {
+            depends_on: vec!["dep-a".to_string()],
+            run_mode: RunMode::Apply,
+        };
+        write_change_config(&dir, &config).unwrap();
+
+        let read_back = read_change_config(&dir);
+        assert_eq!(read_back.depends_on, vec!["dep-a"]);
+        assert_eq!(read_back.run_mode, RunMode::Apply);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_write_dependencies_preserves_run_mode() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-write-deps-preserves-mode");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // Write config with apply mode
+        let config = ChangeConfig {
+            depends_on: vec!["dep-a".to_string()],
+            run_mode: RunMode::Apply,
+        };
+        write_change_config(&dir, &config).unwrap();
+
+        // Update dependencies via write_dependencies
+        write_dependencies(&dir, &["dep-b".to_string()]).unwrap();
+
+        // run_mode should be preserved
+        let read_back = read_change_config(&dir);
+        assert_eq!(read_back.depends_on, vec!["dep-b"]);
+        assert_eq!(read_back.run_mode, RunMode::Apply);
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

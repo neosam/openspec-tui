@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 pub const CONFIG_PATH: &str = "openspec/tui-config.yaml";
 const DEFAULT_COMMAND: &str = "claude --print --dangerously-skip-permissions {prompt}";
+const DEFAULT_INTERACTIVE_COMMAND: &str = "claude";
 
 const DEFAULT_PROMPT: &str = "Before implementing, read the following files for context:\n\
 1. openspec/config.yaml — project context and conventions\n\
@@ -24,6 +25,8 @@ pub struct TuiConfig {
     pub prompt: String,
     #[serde(default)]
     pub post_implementation_prompt: String,
+    #[serde(default = "default_interactive_command")]
+    pub interactive_command: String,
 }
 
 fn default_command() -> String {
@@ -34,12 +37,17 @@ fn default_prompt() -> String {
     DEFAULT_PROMPT.to_string()
 }
 
+fn default_interactive_command() -> String {
+    DEFAULT_INTERACTIVE_COMMAND.to_string()
+}
+
 impl Default for TuiConfig {
     fn default() -> Self {
         Self {
             command: default_command(),
             prompt: default_prompt(),
             post_implementation_prompt: String::new(),
+            interactive_command: default_interactive_command(),
         }
     }
 }
@@ -76,6 +84,14 @@ impl TuiConfig {
             .collect();
         let (first, rest) = parts.split_first()?;
         Some((first.clone(), rest.to_vec()))
+    }
+
+    /// Split `interactive_command` on whitespace and return `(binary, args)`.
+    /// Returns `None` if the command is empty.
+    pub fn build_interactive_command(&self) -> Option<(String, Vec<String>)> {
+        let parts: Vec<&str> = self.interactive_command.split_whitespace().collect();
+        let (first, rest) = parts.split_first()?;
+        Some((first.to_string(), rest.iter().map(|s| s.to_string()).collect()))
     }
 
     /// Load config from `openspec/tui-config.yaml`. Falls back to defaults if file is missing.
@@ -188,6 +204,7 @@ mod tests {
             command: "my-tool {prompt}".to_string(),
             prompt: "do {name} stuff".to_string(),
             post_implementation_prompt: "commit {name}".to_string(),
+            ..Default::default()
         };
         let yaml = serde_yaml::to_string(&config).unwrap();
         let deserialized: TuiConfig = serde_yaml::from_str(&yaml).unwrap();
@@ -208,6 +225,37 @@ mod tests {
     fn test_default_post_implementation_prompt_is_empty() {
         let config = TuiConfig::default();
         assert_eq!(config.post_implementation_prompt, "");
+    }
+
+    #[test]
+    fn test_default_interactive_command() {
+        let config = TuiConfig::default();
+        assert_eq!(config.interactive_command, "claude");
+    }
+
+    #[test]
+    fn test_deserialize_with_interactive_command() {
+        let yaml = "interactive_command: aider\n";
+        let config: TuiConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.interactive_command, "aider");
+    }
+
+    #[test]
+    fn test_deserialize_without_interactive_command_defaults_to_claude() {
+        let yaml = "command: my-tool {prompt}\nprompt: do stuff\n";
+        let config: TuiConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.interactive_command, "claude");
+    }
+
+    #[test]
+    fn test_serialize_roundtrip_with_interactive_command() {
+        let config = TuiConfig {
+            interactive_command: "aider --model gpt4".to_string(),
+            ..Default::default()
+        };
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        let deserialized: TuiConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(deserialized.interactive_command, "aider --model gpt4");
     }
 
     mod placeholder_tests {
@@ -357,6 +405,45 @@ mod tests {
             };
             let (bin, args) = config.build_command("test").unwrap();
             assert_eq!(bin, "my-script");
+            assert!(args.is_empty());
+        }
+
+        #[test]
+        fn test_build_interactive_command_default() {
+            let config = TuiConfig::default();
+            let (bin, args) = config.build_interactive_command().unwrap();
+            assert_eq!(bin, "claude");
+            assert!(args.is_empty());
+        }
+
+        #[test]
+        fn test_build_interactive_command_with_args() {
+            let config = TuiConfig {
+                interactive_command: "claude --model opus".to_string(),
+                ..Default::default()
+            };
+            let (bin, args) = config.build_interactive_command().unwrap();
+            assert_eq!(bin, "claude");
+            assert_eq!(args, vec!["--model", "opus"]);
+        }
+
+        #[test]
+        fn test_build_interactive_command_empty_returns_none() {
+            let config = TuiConfig {
+                interactive_command: "".to_string(),
+                ..Default::default()
+            };
+            assert!(config.build_interactive_command().is_none());
+        }
+
+        #[test]
+        fn test_build_interactive_command_single_binary() {
+            let config = TuiConfig {
+                interactive_command: "aider".to_string(),
+                ..Default::default()
+            };
+            let (bin, args) = config.build_interactive_command().unwrap();
+            assert_eq!(bin, "aider");
             assert!(args.is_empty());
         }
     }

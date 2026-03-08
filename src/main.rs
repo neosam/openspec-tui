@@ -77,6 +77,29 @@ fn edit_in_external_editor(
     Ok(edited)
 }
 
+/// Suspend the TUI, run the configured interactive command, and restore the TUI.
+fn launch_interactive_tool(
+    terminal: &mut ratatui::Terminal<CrosstermBackend<io::Stdout>>,
+    config: &config::TuiConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some((binary, args)) = config.build_interactive_command() else {
+        return Ok(());
+    };
+
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+
+    let _ = std::process::Command::new(&binary)
+        .args(&args)
+        .status();
+
+    enable_raw_mode()?;
+    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+    terminal.clear()?;
+
+    Ok(())
+}
+
 fn run_app(terminal: &mut ratatui::Terminal<CrosstermBackend<io::Stdout>>) -> Result<(), Box<dyn std::error::Error>> {
     let mut app = App::new()?;
 
@@ -126,9 +149,19 @@ fn run_app(terminal: &mut ratatui::Terminal<CrosstermBackend<io::Stdout>>) -> Re
                     continue;
                 }
 
+                if key.code == KeyCode::Char('r') {
+                    app.refresh_screen();
+                    continue;
+                }
+
                 match &app.screen {
                     Screen::ChangeList { .. } => {
                         app.handle_change_list_input(key.code);
+                        if app.launch_interactive {
+                            app.launch_interactive = false;
+                            launch_interactive_tool(terminal, &app.config)?;
+                            app.reload_changes();
+                        }
                     }
                     Screen::ArtifactMenu { .. } => {
                         app.handle_artifact_menu_input(key.code);

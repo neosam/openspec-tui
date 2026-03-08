@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::config::TuiConfig;
-use crate::data::{self, ChangeEntry, ChangeStatusOutput};
+use crate::data::{self, ChangeEntry, ChangeStatusOutput, RunMode};
 use crate::runner::{self, stop_implementation, BatchImplState, ImplState};
 #[cfg(test)]
 use crate::data::ArtifactStatus;
@@ -19,6 +19,7 @@ pub enum ConfigField {
     Command,
     Prompt,
     PostImplementationPrompt,
+    InteractiveCommand,
 }
 
 #[derive(Debug, Clone)]
@@ -42,11 +43,13 @@ pub enum Screen {
         content: String,
         scroll: usize,
         is_plain_text: bool,
+        file_path: Option<PathBuf>,
     },
     Config {
         command: String,
         prompt: String,
         post_implementation_prompt: String,
+        interactive_command: String,
         cursor_position: usize,
         focused_field: ConfigField,
         editing: bool,
@@ -56,6 +59,7 @@ pub enum Screen {
         change_dir: PathBuf,
         dependencies: Vec<String>,
         selected: usize,
+        run_mode: data::RunMode,
     },
     DependencyAdd {
         change_name: String,
@@ -97,6 +101,7 @@ pub struct App {
     pub screen: Screen,
     pub screen_stack: Vec<Screen>,
     pub should_quit: bool,
+    pub launch_interactive: bool,
     pub implementation: Option<ImplState>,
     pub batch: Option<BatchImplState>,
     pub config: TuiConfig,
@@ -132,6 +137,7 @@ impl App {
             screen,
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: None,
             config,
@@ -192,10 +198,193 @@ impl App {
         let next = batch.advance(success);
 
         if let Some(next_name) = next {
-            self.implementation = Some(runner::start_implementation(&next_name, &self.config));
+            let change_dir = self.find_change_dir(&next_name, false);
+            let run_mode = data::read_run_mode(&change_dir);
+            self.implementation = Some(match run_mode {
+                RunMode::Normal => runner::start_implementation(&next_name, &self.config),
+                RunMode::Apply => runner::start_apply(&next_name, &self.config),
+            });
         } else {
             // Batch is finished
             self.batch = None;
+        }
+    }
+
+    /// Reload the change list data (called after returning from interactive tool).
+    pub fn reload_changes(&mut self) {
+        if let Screen::ChangeList { changes, selected, tab, change_deps, .. } = &mut self.screen {
+            if *tab == ChangeTab::Active {
+                match data::list_changes() {
+                    Ok(list) => {
+                        *changes = list.changes;
+                        *change_deps = data::load_change_dependencies(changes);
+                    }
+                    Err(_) => {
+                        *changes = Vec::new();
+                        *change_deps = HashMap::new();
+                    }
+                }
+            } else {
+                match data::list_archived_changes() {
+                    Ok(archived) => {
+                        *changes = archived;
+                    }
+                    Err(_) => {
+                        *changes = Vec::new();
+                    }
+                }
+                *change_deps = HashMap::new();
+            }
+            if *selected >= changes.len() && !changes.is_empty() {
+                *selected = changes.len() - 1;
+            }
+        }
+    }
+
+    /// Refresh the current screen's data from underlying sources.
+    ///
+    /// Each screen variant reloads its data by re-calling the same data functions
+    /// used during initial construction. Selection indices are clamped to the new
+    /// data length. Config screen is a no-op since it is edited directly in the TUI.
+    pub fn refresh_screen(&mut self) {
+        match &mut self.screen {
+            Screen::ChangeList {
+                changes,
+                selected,
+                tab,
+                change_deps,
+                ..
+            } => {
+                if *tab == ChangeTab::Active {
+                    match data::list_changes() {
+                        Ok(list) => {
+                            *changes = list.changes;
+                            *change_deps = data::load_change_dependencies(changes);
+                        }
+                        Err(_) => {
+                            *changes = Vec::new();
+                            *change_deps = HashMap::new();
+                        }
+                    }
+                } else {
+                    match data::list_archived_changes() {
+                        Ok(archived) => {
+                            *changes = archived;
+                        }
+                        Err(_) => {
+                            *changes = Vec::new();
+                        }
+                    }
+                    *change_deps = HashMap::new();
+                }
+                if !changes.is_empty() {
+                    *selected = (*selected).min(changes.len().saturating_sub(1));
+                } else {
+                    *selected = 0;
+                }
+            }
+            Screen::ArtifactMenu {
+                change_name,
+                change_dir,
+                items,
+                selected,
+                is_archived,
+            } => {
+                let status = if *is_archived {
+                    data::get_archived_change_status(change_dir)
+                } else {
+                    match data::get_change_status(change_name) {
+                        Ok(s) => s,
+                        Err(_) => return,
+                    }
+                };
+                *items = build_artifact_menu_items(&status, change_dir, *is_archived);
+                if !items.is_empty() {
+                    *selected = (*selected).min(items.len().saturating_sub(1));
+                } else {
+                    *selected = 0;
+                }
+            }
+            Screen::ArtifactView {
+                content,
+                file_path,
+                ..
+            } => {
+                if let Some(path) = file_path {
+                    *content = data::read_artifact_content(path)
+                        .unwrap_or_else(|e| format!("Error reading file: {e}"));
+                }
+            }
+            Screen::DependencyView {
+                change_dir,
+                dependencies,
+                selected,
+                run_mode,
+                ..
+            } => {
+                let config = data::read_change_config(change_dir);
+                *dependencies = config.depends_on;
+                *run_mode = config.run_mode;
+                if !dependencies.is_empty() {
+                    *selected = (*selected).min(dependencies.len().saturating_sub(1));
+                } else {
+                    *selected = 0;
+                }
+            }
+            Screen::DependencyGraph {
+                graph_text,
+                ..
+            } => {
+                // Reload changes and deps from scratch
+                if let Ok(list) = data::list_changes() {
+                    let change_deps = data::load_change_dependencies(&list.changes);
+                    *graph_text = data::generate_dependency_graph(&change_deps);
+                }
+            }
+            Screen::RunAllSelection {
+                entries,
+                selected,
+                ..
+            } => {
+                if let Ok(list) = data::list_changes() {
+                    *entries = build_run_all_entries(&list.changes);
+                    if !entries.is_empty() {
+                        *selected = (*selected).min(entries.len().saturating_sub(1));
+                    } else {
+                        *selected = 0;
+                    }
+                }
+            }
+            Screen::DependencyAdd {
+                change_name,
+                available_changes,
+                selected,
+                ..
+            } => {
+                let change_name = change_name.clone();
+                // Reload existing deps to filter them out
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let change_dir = cwd.join("openspec").join("changes").join(&change_name);
+                let current_deps = data::read_dependencies(&change_dir);
+                let available: Vec<String> = match data::list_changes() {
+                    Ok(list) => list
+                        .changes
+                        .into_iter()
+                        .map(|c| c.name)
+                        .filter(|n| *n != change_name && !current_deps.contains(n))
+                        .collect(),
+                    Err(_) => Vec::new(),
+                };
+                *available_changes = available;
+                if !available_changes.is_empty() {
+                    *selected = (*selected).min(available_changes.len().saturating_sub(1));
+                } else {
+                    *selected = 0;
+                }
+            }
+            Screen::Config { .. } => {
+                // No-op: Config is edited directly in the TUI
+            }
         }
     }
 
@@ -292,6 +481,11 @@ impl App {
                     self.screen_stack.push(old_screen);
                 }
             }
+            KeyCode::Char('I') => {
+                if *tab == ChangeTab::Active && self.implementation.is_none() {
+                    self.launch_interactive = true;
+                }
+            }
             _ => {}
         }
     }
@@ -369,14 +563,15 @@ impl App {
                 if item.is_dependency_item {
                     let change_name = change_name.clone();
                     let change_dir = change_dir.clone();
-                    let dependencies = data::read_dependencies(&change_dir);
+                    let config = data::read_change_config(&change_dir);
                     let old_screen = std::mem::replace(
                         &mut self.screen,
                         Screen::DependencyView {
                             change_name,
                             change_dir,
-                            dependencies,
+                            dependencies: config.depends_on,
                             selected: 0,
+                            run_mode: config.run_mode,
                         },
                     );
                     self.screen_stack.push(old_screen);
@@ -385,6 +580,7 @@ impl App {
                     let content = data::read_artifact_content(path)
                         .unwrap_or_else(|e| format!("Error reading file: {e}"));
                     let is_plain_text = path.extension().is_some_and(|ext| ext == "log");
+                    let file_path = Some(path.clone());
                     let change_dir = change_dir.clone();
                     let old_screen = std::mem::replace(
                         &mut self.screen,
@@ -393,6 +589,7 @@ impl App {
                             content,
                             scroll: 0,
                             is_plain_text,
+                            file_path,
                         },
                     );
                     let _ = change_dir;
@@ -404,6 +601,7 @@ impl App {
                 if log_path.exists() {
                     let content = data::read_artifact_content(&log_path)
                         .unwrap_or_else(|e| format!("Error reading file: {e}"));
+                    let file_path = Some(log_path);
                     let old_screen = std::mem::replace(
                         &mut self.screen,
                         Screen::ArtifactView {
@@ -411,6 +609,7 @@ impl App {
                             content,
                             scroll: 0,
                             is_plain_text: true,
+                            file_path,
                         },
                     );
                     self.screen_stack.push(old_screen);
@@ -420,9 +619,14 @@ impl App {
                 if !*is_archived && self.implementation.is_none() {
                     let name = change_name.clone();
                     let log_path = change_dir.clone().join("implementation.log");
-                    self.implementation = Some(runner::start_implementation(&name, &self.config));
+                    let run_mode = data::read_run_mode(change_dir);
+                    self.implementation = Some(match run_mode {
+                        RunMode::Normal => runner::start_implementation(&name, &self.config),
+                        RunMode::Apply => runner::start_apply(&name, &self.config),
+                    });
                     let content = data::read_artifact_content(&log_path)
                         .unwrap_or_default();
+                    let file_path = Some(log_path);
                     let old_screen = std::mem::replace(
                         &mut self.screen,
                         Screen::ArtifactView {
@@ -430,6 +634,7 @@ impl App {
                             content,
                             scroll: 0,
                             is_plain_text: true,
+                            file_path,
                         },
                     );
                     self.screen_stack.push(old_screen);
@@ -454,6 +659,7 @@ impl App {
                 command: self.config.command.clone(),
                 prompt: self.config.prompt.clone(),
                 post_implementation_prompt: self.config.post_implementation_prompt.clone(),
+                interactive_command: self.config.interactive_command.clone(),
                 cursor_position: self.config.command.len(),
                 focused_field: ConfigField::Command,
                 editing: false,
@@ -469,6 +675,7 @@ impl App {
             command,
             prompt,
             post_implementation_prompt,
+            interactive_command,
             cursor_position,
             focused_field,
             editing,
@@ -478,24 +685,29 @@ impl App {
         };
 
         if *editing {
-            // Edit mode (Command field only)
+            // Edit mode (Command or InteractiveCommand field)
+            let edit_target = if *focused_field == ConfigField::InteractiveCommand {
+                interactive_command
+            } else {
+                command
+            };
             match key {
                 KeyCode::Esc | KeyCode::Enter => {
                     *editing = false;
                 }
                 KeyCode::Char(c) => {
-                    command.insert(*cursor_position, c);
+                    edit_target.insert(*cursor_position, c);
                     *cursor_position += 1;
                 }
                 KeyCode::Backspace => {
                     if *cursor_position > 0 {
                         *cursor_position -= 1;
-                        command.remove(*cursor_position);
+                        edit_target.remove(*cursor_position);
                     }
                 }
                 KeyCode::Delete => {
-                    if *cursor_position < command.len() {
-                        command.remove(*cursor_position);
+                    if *cursor_position < edit_target.len() {
+                        edit_target.remove(*cursor_position);
                     }
                 }
                 KeyCode::Left => {
@@ -504,7 +716,7 @@ impl App {
                     }
                 }
                 KeyCode::Right => {
-                    if *cursor_position < command.len() {
+                    if *cursor_position < edit_target.len() {
                         *cursor_position += 1;
                     }
                 }
@@ -512,7 +724,7 @@ impl App {
                     *cursor_position = 0;
                 }
                 KeyCode::End => {
-                    *cursor_position = command.len();
+                    *cursor_position = edit_target.len();
                 }
                 _ => {}
             }
@@ -523,10 +735,13 @@ impl App {
                     *focused_field = match focused_field {
                         ConfigField::Command => ConfigField::Prompt,
                         ConfigField::Prompt => ConfigField::PostImplementationPrompt,
-                        ConfigField::PostImplementationPrompt => ConfigField::Command,
+                        ConfigField::PostImplementationPrompt => ConfigField::InteractiveCommand,
+                        ConfigField::InteractiveCommand => ConfigField::Command,
                     };
                     if *focused_field == ConfigField::Command {
                         *cursor_position = command.len();
+                    } else if *focused_field == ConfigField::InteractiveCommand {
+                        *cursor_position = interactive_command.len();
                     }
                 }
                 KeyCode::Esc => {
@@ -539,6 +754,9 @@ impl App {
                     if *focused_field == ConfigField::Command {
                         *cursor_position = command.len();
                         *editing = true;
+                    } else if *focused_field == ConfigField::InteractiveCommand {
+                        *cursor_position = interactive_command.len();
+                        *editing = true;
                     } else {
                         // Prompt or PostImplementationPrompt field: signal caller to open $EDITOR
                         return true;
@@ -550,6 +768,7 @@ impl App {
                         command: command.clone(),
                         prompt: prompt.clone(),
                         post_implementation_prompt: post_implementation_prompt.clone(),
+                        interactive_command: interactive_command.clone(),
                     };
                     let _ = new_config.save_to(&self.config_path);
                     self.config = new_config;
@@ -563,6 +782,7 @@ impl App {
                     *command = defaults.command;
                     *prompt = defaults.prompt;
                     *post_implementation_prompt = defaults.post_implementation_prompt;
+                    *interactive_command = defaults.interactive_command;
                     *cursor_position = command.len();
                     *focused_field = ConfigField::Command;
                 }
@@ -592,6 +812,7 @@ impl App {
             change_dir,
             dependencies,
             selected,
+            run_mode,
         } = &mut self.screen
         else {
             return;
@@ -616,6 +837,17 @@ impl App {
                         *selected = dependencies.len().saturating_sub(1);
                     }
                 }
+            }
+            KeyCode::Char('M') => {
+                *run_mode = match run_mode {
+                    RunMode::Normal => RunMode::Apply,
+                    RunMode::Apply => RunMode::Normal,
+                };
+                let config = data::ChangeConfig {
+                    depends_on: dependencies.clone(),
+                    run_mode: run_mode.clone(),
+                };
+                let _ = data::write_change_config(change_dir, &config);
             }
             KeyCode::Char('A') => {
                 let change_name = change_name.clone();
@@ -847,9 +1079,16 @@ impl App {
                             let batch =
                                 BatchImplState::new(sorted.clone(), deps_map);
                             self.batch = Some(batch);
-                            self.implementation = Some(
-                                runner::start_implementation(first, &self.config),
-                            );
+                            let change_dir = changes_dir.join(first);
+                            let run_mode = data::read_run_mode(&change_dir);
+                            self.implementation = Some(match run_mode {
+                                RunMode::Normal => {
+                                    runner::start_implementation(first, &self.config)
+                                }
+                                RunMode::Apply => {
+                                    runner::start_apply(first, &self.config)
+                                }
+                            });
                         }
                         if let Some(prev) = self.screen_stack.pop() {
                             self.screen = prev;
@@ -1085,6 +1324,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
@@ -1116,6 +1356,7 @@ mod tests {
             },
             screen_stack: vec![original_screen],
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
@@ -1143,9 +1384,11 @@ mod tests {
                 content: "hello\nworld".to_string(),
                 scroll: 0,
                 is_plain_text: false,
+                file_path: None,
             },
             screen_stack: vec![menu_screen],
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
@@ -1187,6 +1430,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
@@ -1237,9 +1481,11 @@ mod tests {
                 content: "line1\nline2\nline3\nline4\nline5".to_string(),
                 scroll: 0,
                 is_plain_text: false,
+                file_path: None,
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
@@ -1311,6 +1557,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
@@ -1384,6 +1631,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
@@ -1413,6 +1661,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
@@ -1435,6 +1684,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
@@ -1476,6 +1726,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: Some(existing_impl),
             batch: None,
             config: TuiConfig::default(),
@@ -1518,6 +1769,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: Some(existing_impl),
             batch: None,
             config: TuiConfig::default(),
@@ -1542,6 +1794,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
@@ -1577,9 +1830,11 @@ mod tests {
                 content: "content".to_string(),
                 scroll: 0,
                 is_plain_text: false,
+                file_path: None,
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: Some(existing_impl),
             batch: None,
             config: TuiConfig::default(),
@@ -1621,6 +1876,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: Some(existing_impl),
             batch: None,
             config: TuiConfig::default(),
@@ -1660,6 +1916,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: Some(impl_state),
             batch: None,
             config: TuiConfig::default(),
@@ -1712,6 +1969,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: Some(impl_state),
             batch: None,
             config: TuiConfig::default(),
@@ -1751,6 +2009,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: Some(impl_state),
             batch: None,
             config: TuiConfig::default(),
@@ -1783,6 +2042,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
@@ -1820,6 +2080,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: Some(impl_state),
             batch: None,
             config: TuiConfig::default(),
@@ -1893,6 +2154,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
@@ -1923,6 +2185,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
@@ -1950,6 +2213,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
@@ -1981,6 +2245,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
@@ -2010,6 +2275,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
@@ -2036,6 +2302,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
@@ -2080,6 +2347,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
@@ -2104,6 +2372,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
@@ -2129,6 +2398,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
@@ -2154,6 +2424,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
@@ -2177,6 +2448,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
@@ -2203,6 +2475,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
@@ -2246,6 +2519,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
@@ -2279,6 +2553,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
@@ -2314,6 +2589,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
@@ -2353,6 +2629,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
@@ -2383,6 +2660,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: None,
             config: TuiConfig {
@@ -2415,6 +2693,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
@@ -2432,9 +2711,11 @@ mod tests {
                 content: "content".to_string(),
                 scroll: 0,
                 is_plain_text: false,
+                file_path: None,
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
@@ -2513,6 +2794,12 @@ mod tests {
         app.handle_config_input(KeyCode::Tab);
         if let Screen::Config { focused_field, .. } = &app.screen {
             assert_eq!(*focused_field, ConfigField::PostImplementationPrompt);
+        }
+
+        // Tab -> InteractiveCommand
+        app.handle_config_input(KeyCode::Tab);
+        if let Screen::Config { focused_field, .. } = &app.screen {
+            assert_eq!(*focused_field, ConfigField::InteractiveCommand);
         }
 
         // Tab -> Command (wraps around)
@@ -2899,6 +3186,155 @@ mod tests {
     }
 
     #[test]
+    fn test_config_tab_cycling_includes_interactive_command() {
+        let mut app = make_config_app();
+        app.push_config_screen();
+
+        app.handle_config_input(KeyCode::Tab); // -> Prompt
+        if let Screen::Config { focused_field, .. } = &app.screen {
+            assert_eq!(*focused_field, ConfigField::Prompt);
+        }
+        app.handle_config_input(KeyCode::Tab); // -> PostImplementationPrompt
+        if let Screen::Config { focused_field, .. } = &app.screen {
+            assert_eq!(*focused_field, ConfigField::PostImplementationPrompt);
+        }
+        app.handle_config_input(KeyCode::Tab); // -> InteractiveCommand
+        if let Screen::Config { focused_field, .. } = &app.screen {
+            assert_eq!(*focused_field, ConfigField::InteractiveCommand);
+        }
+        app.handle_config_input(KeyCode::Tab); // -> Command (wrap around)
+        if let Screen::Config { focused_field, .. } = &app.screen {
+            assert_eq!(*focused_field, ConfigField::Command);
+        }
+    }
+
+    #[test]
+    fn test_config_enter_on_interactive_command_activates_edit() {
+        let mut app = make_config_app();
+        app.push_config_screen();
+
+        // Navigate to InteractiveCommand
+        app.handle_config_input(KeyCode::Tab); // -> Prompt
+        app.handle_config_input(KeyCode::Tab); // -> PostImplementationPrompt
+        app.handle_config_input(KeyCode::Tab); // -> InteractiveCommand
+
+        let result = app.handle_config_input(KeyCode::Enter);
+        assert!(!result, "Enter on InteractiveCommand should not signal editor");
+        if let Screen::Config { editing, focused_field, .. } = &app.screen {
+            assert!(*editing, "Should be in edit mode");
+            assert_eq!(*focused_field, ConfigField::InteractiveCommand);
+        }
+    }
+
+    #[test]
+    fn test_config_typing_in_interactive_command_field() {
+        let mut app = make_config_app();
+        app.push_config_screen();
+
+        // Navigate to InteractiveCommand and enter edit mode
+        app.handle_config_input(KeyCode::Tab); // -> Prompt
+        app.handle_config_input(KeyCode::Tab); // -> PostImplementationPrompt
+        app.handle_config_input(KeyCode::Tab); // -> InteractiveCommand
+        app.handle_config_input(KeyCode::Enter); // edit mode
+
+        // Type some chars
+        app.handle_config_input(KeyCode::Char(' '));
+        app.handle_config_input(KeyCode::Char('-'));
+        app.handle_config_input(KeyCode::Char('-'));
+        app.handle_config_input(KeyCode::Char('v'));
+
+        if let Screen::Config { interactive_command, .. } = &app.screen {
+            assert_eq!(interactive_command, "claude --v");
+        } else {
+            panic!("Expected Config screen");
+        }
+    }
+
+    #[test]
+    fn test_config_save_persists_interactive_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.yaml");
+
+        let mut app = App {
+            screen: Screen::ChangeList {
+                changes: vec![],
+                selected: 0,
+                error: None,
+                tab: ChangeTab::Active,
+                change_deps: HashMap::new(),
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            launch_interactive: false,
+            implementation: None,
+            batch: None,
+            config: TuiConfig::default(),
+            config_path: config_path.clone(),
+        };
+
+        app.push_config_screen();
+
+        // Navigate to InteractiveCommand and edit
+        app.handle_config_input(KeyCode::Tab); // -> Prompt
+        app.handle_config_input(KeyCode::Tab); // -> PostImplementationPrompt
+        app.handle_config_input(KeyCode::Tab); // -> InteractiveCommand
+        app.handle_config_input(KeyCode::Enter); // edit mode
+
+        // Clear and type "aider"
+        // First select all and delete current content
+        app.handle_config_input(KeyCode::Home);
+        for _ in 0..10 {
+            app.handle_config_input(KeyCode::Delete);
+        }
+        app.handle_config_input(KeyCode::Char('a'));
+        app.handle_config_input(KeyCode::Char('i'));
+        app.handle_config_input(KeyCode::Char('d'));
+        app.handle_config_input(KeyCode::Char('e'));
+        app.handle_config_input(KeyCode::Char('r'));
+        app.handle_config_input(KeyCode::Esc); // exit edit mode
+
+        // Save
+        app.handle_config_input(KeyCode::Char('S'));
+
+        assert_eq!(app.config.interactive_command, "aider");
+
+        // Verify persisted
+        let loaded = TuiConfig::load_from(&config_path).unwrap();
+        assert_eq!(loaded.interactive_command, "aider");
+    }
+
+    #[test]
+    fn test_config_reset_defaults_restores_interactive_command() {
+        let mut app = make_config_app();
+        app.push_config_screen();
+
+        // Navigate to InteractiveCommand and edit it
+        app.handle_config_input(KeyCode::Tab); // -> Prompt
+        app.handle_config_input(KeyCode::Tab); // -> PostImplementationPrompt
+        app.handle_config_input(KeyCode::Tab); // -> InteractiveCommand
+        app.handle_config_input(KeyCode::Enter); // edit mode
+        app.handle_config_input(KeyCode::Home);
+        for _ in 0..10 {
+            app.handle_config_input(KeyCode::Delete);
+        }
+        app.handle_config_input(KeyCode::Char('x'));
+        app.handle_config_input(KeyCode::Esc); // exit edit mode
+
+        if let Screen::Config { interactive_command, .. } = &app.screen {
+            assert_eq!(interactive_command, "x");
+        }
+
+        // Reset to defaults
+        app.handle_config_input(KeyCode::Char('D'));
+
+        if let Screen::Config { interactive_command, .. } = &app.screen {
+            assert_eq!(interactive_command, "claude");
+        } else {
+            panic!("Expected Config screen");
+        }
+    }
+
+    #[test]
     fn test_advance_batch_with_explicit_success() {
         let batch = BatchImplState::new(
             vec!["change-a".to_string(), "change-b".to_string()],
@@ -2914,6 +3350,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: Some(batch),
             config: TuiConfig::default(),
@@ -2948,6 +3385,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: Some(batch),
             config: TuiConfig::default(),
@@ -2968,9 +3406,11 @@ mod tests {
                 change_dir: PathBuf::from("/tmp/nonexistent"),
                 dependencies: deps.into_iter().map(String::from).collect(),
                 selected: 0,
+                run_mode: RunMode::Normal,
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
@@ -3026,9 +3466,11 @@ mod tests {
                 change_dir: dir.clone(),
                 dependencies: vec!["dep-a".to_string(), "dep-b".to_string(), "dep-c".to_string()],
                 selected: 1,
+                run_mode: RunMode::Normal,
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
@@ -3056,9 +3498,11 @@ mod tests {
                 change_dir: dir.clone(),
                 dependencies: vec!["dep-a".to_string(), "dep-b".to_string()],
                 selected: 1,
+                run_mode: RunMode::Normal,
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
@@ -3101,9 +3545,11 @@ mod tests {
                 change_dir: PathBuf::from("/tmp"),
                 dependencies: vec!["dep-a".to_string()],
                 selected: 0,
+                run_mode: RunMode::Normal,
             },
             screen_stack: vec![parent_screen],
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
@@ -3128,6 +3574,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
@@ -3166,6 +3613,7 @@ mod tests {
             change_dir: dir.clone(),
             dependencies: vec!["existing-dep".to_string()],
             selected: 0,
+            run_mode: RunMode::Normal,
         };
 
         let mut app = App {
@@ -3177,6 +3625,7 @@ mod tests {
             },
             screen_stack: vec![dep_view],
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
@@ -3203,6 +3652,7 @@ mod tests {
             change_dir: PathBuf::from("/tmp"),
             dependencies: vec!["existing-dep".to_string()],
             selected: 0,
+            run_mode: RunMode::Normal,
         };
 
         let mut app = App {
@@ -3214,6 +3664,7 @@ mod tests {
             },
             screen_stack: vec![dep_view],
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
@@ -3256,7 +3707,7 @@ mod tests {
         let dir = std::env::temp_dir().join("openspec-tui-test-dep-item-count");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
-            dir.join("dependencies.yaml"),
+            dir.join("change-config.yaml"),
             "depends_on:\n  - change-a\n  - change-b\n",
         )
         .unwrap();
@@ -3302,7 +3753,7 @@ mod tests {
         let dir = std::env::temp_dir().join("openspec-tui-test-dep-item-enter");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
-            dir.join("dependencies.yaml"),
+            dir.join("change-config.yaml"),
             "depends_on:\n  - dep-one\n",
         )
         .unwrap();
@@ -3323,6 +3774,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
@@ -3362,6 +3814,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
@@ -3414,6 +3867,7 @@ mod tests {
             },
             screen_stack: vec![parent],
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
@@ -3453,6 +3907,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
@@ -3476,6 +3931,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
@@ -3485,6 +3941,99 @@ mod tests {
         app.handle_change_list_input(KeyCode::Char('G'));
         assert!(matches!(app.screen, Screen::ChangeList { .. }));
         assert!(app.screen_stack.is_empty());
+    }
+
+    #[test]
+    fn test_change_list_i_signals_interactive_launch_on_active_tab() {
+        let mut app = App {
+            screen: Screen::ChangeList {
+                changes: vec![ChangeEntry {
+                    name: "test".to_string(),
+                    completed_tasks: 0,
+                    total_tasks: 5,
+                    status: "in-progress".to_string(),
+                }],
+                selected: 0,
+                error: None,
+                tab: ChangeTab::Active,
+                change_deps: HashMap::new(),
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            launch_interactive: false,
+            implementation: None,
+            batch: None,
+            config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
+        };
+
+        app.handle_change_list_input(KeyCode::Char('I'));
+        assert!(app.launch_interactive);
+    }
+
+    #[test]
+    fn test_change_list_i_ignored_on_archived_tab() {
+        let mut app = App {
+            screen: Screen::ChangeList {
+                changes: vec![],
+                selected: 0,
+                error: None,
+                tab: ChangeTab::Archived,
+                change_deps: HashMap::new(),
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            launch_interactive: false,
+            implementation: None,
+            batch: None,
+            config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
+        };
+
+        app.handle_change_list_input(KeyCode::Char('I'));
+        assert!(!app.launch_interactive);
+    }
+
+    #[test]
+    fn test_change_list_i_ignored_during_running_implementation() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{mpsc, Arc, Mutex};
+
+        let (_tx, rx) = mpsc::channel();
+        let existing_impl = crate::runner::ImplState {
+            change_name: "existing-change".to_string(),
+            completed: 1,
+            total: 5,
+            log_path: PathBuf::from("/tmp/existing.log"),
+            receiver: rx,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            child_handle: Arc::new(Mutex::new(None)),
+        };
+
+        let mut app = App {
+            screen: Screen::ChangeList {
+                changes: vec![ChangeEntry {
+                    name: "test".to_string(),
+                    completed_tasks: 0,
+                    total_tasks: 5,
+                    status: "in-progress".to_string(),
+                }],
+                selected: 0,
+                error: None,
+                tab: ChangeTab::Active,
+                change_deps: HashMap::new(),
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            launch_interactive: false,
+            implementation: Some(existing_impl),
+            batch: None,
+            config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
+        };
+
+        app.handle_change_list_input(KeyCode::Char('I'));
+        assert!(!app.launch_interactive);
     }
 
     // --- RunAllSelection tests ---
@@ -3504,6 +4053,7 @@ mod tests {
                 change_deps: HashMap::new(),
             }],
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
@@ -3643,6 +4193,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
@@ -3666,6 +4217,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: None,
             config: TuiConfig::default(),
@@ -3708,6 +4260,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: Some(existing_impl),
             batch: None,
             config: TuiConfig::default(),
@@ -3808,6 +4361,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: Some(impl_state),
             batch: Some(batch),
             config: TuiConfig::default(),
@@ -3855,6 +4409,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: Some(impl_state),
             batch: Some(batch),
             config: TuiConfig::default(),
@@ -3916,6 +4471,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: Some(impl_state),
             batch: Some(batch),
             config: TuiConfig::default(),
@@ -3968,6 +4524,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: Some(impl_state),
             batch: None,
             config: TuiConfig::default(),
@@ -4033,6 +4590,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: Some(existing_impl),
             batch: Some(batch),
             config: TuiConfig::default(),
@@ -4067,6 +4625,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: None,
             batch: Some(batch),
             config: TuiConfig::default(),
@@ -4106,6 +4665,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: Some(existing_impl),
             batch: None,
             config: TuiConfig::default(),
@@ -4156,6 +4716,7 @@ mod tests {
             },
             screen_stack: Vec::new(),
             should_quit: false,
+            launch_interactive: false,
             implementation: Some(impl_state),
             batch: Some(batch),
             config: TuiConfig::default(),
@@ -4181,5 +4742,496 @@ mod tests {
 
         // Clean up spawned implementation thread
         app.stop_running_implementation();
+    }
+
+    // --- Run Mode Tests ---
+
+    #[test]
+    fn test_r_key_dispatches_apply_mode() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-r-apply-mode");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("change-config.yaml"),
+            "run_mode: apply\n",
+        )
+        .unwrap();
+
+        let mut app = App {
+            screen: Screen::ArtifactMenu {
+                change_name: "apply-change".to_string(),
+                change_dir: dir.clone(),
+                items: vec![],
+                selected: 0,
+                is_archived: false,
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            launch_interactive: false,
+            implementation: None,
+            batch: None,
+            config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
+        };
+
+        app.handle_artifact_menu_input(KeyCode::Char('R'));
+        assert!(app.implementation.is_some());
+        assert_eq!(
+            app.implementation.as_ref().unwrap().change_name,
+            "apply-change"
+        );
+        // Apply mode sends no progress, so total should be 0
+        assert_eq!(app.implementation.as_ref().unwrap().total, 0);
+
+        app.stop_running_implementation();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_r_key_dispatches_normal_mode_by_default() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-r-normal-default");
+        std::fs::create_dir_all(&dir).unwrap();
+        // No change-config.yaml → defaults to normal mode
+
+        let mut app = App {
+            screen: Screen::ArtifactMenu {
+                change_name: "normal-change".to_string(),
+                change_dir: dir.clone(),
+                items: vec![],
+                selected: 0,
+                is_archived: false,
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            launch_interactive: false,
+            implementation: None,
+            batch: None,
+            config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
+        };
+
+        app.handle_artifact_menu_input(KeyCode::Char('R'));
+        assert!(app.implementation.is_some());
+        assert_eq!(
+            app.implementation.as_ref().unwrap().change_name,
+            "normal-change"
+        );
+
+        app.stop_running_implementation();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_m_key_toggles_run_mode_normal_to_apply() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-m-toggle-to-apply");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut app = App {
+            screen: Screen::DependencyView {
+                change_name: "test-change".to_string(),
+                change_dir: dir.clone(),
+                dependencies: vec![],
+                selected: 0,
+                run_mode: RunMode::Normal,
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            launch_interactive: false,
+            implementation: None,
+            batch: None,
+            config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
+        };
+
+        app.handle_dependency_view_input(KeyCode::Char('M'));
+
+        if let Screen::DependencyView { run_mode, .. } = &app.screen {
+            assert_eq!(*run_mode, RunMode::Apply);
+        } else {
+            panic!("Expected DependencyView screen");
+        }
+
+        // Verify it was persisted
+        let saved = data::read_run_mode(&dir);
+        assert_eq!(saved, RunMode::Apply);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_m_key_toggles_run_mode_apply_to_normal() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-m-toggle-to-normal");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut app = App {
+            screen: Screen::DependencyView {
+                change_name: "test-change".to_string(),
+                change_dir: dir.clone(),
+                dependencies: vec![],
+                selected: 0,
+                run_mode: RunMode::Apply,
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            launch_interactive: false,
+            implementation: None,
+            batch: None,
+            config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
+        };
+
+        app.handle_dependency_view_input(KeyCode::Char('M'));
+
+        if let Screen::DependencyView { run_mode, .. } = &app.screen {
+            assert_eq!(*run_mode, RunMode::Normal);
+        } else {
+            panic!("Expected DependencyView screen");
+        }
+
+        // Verify it was persisted
+        let saved = data::read_run_mode(&dir);
+        assert_eq!(saved, RunMode::Normal);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_m_key_preserves_dependencies() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-m-preserves-deps");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("change-config.yaml"),
+            "depends_on:\n  - dep-a\n  - dep-b\nrun_mode: normal\n",
+        )
+        .unwrap();
+
+        let mut app = App {
+            screen: Screen::DependencyView {
+                change_name: "test-change".to_string(),
+                change_dir: dir.clone(),
+                dependencies: vec!["dep-a".to_string(), "dep-b".to_string()],
+                selected: 0,
+                run_mode: RunMode::Normal,
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            launch_interactive: false,
+            implementation: None,
+            batch: None,
+            config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
+        };
+
+        app.handle_dependency_view_input(KeyCode::Char('M'));
+
+        // Dependencies should be preserved
+        let config = data::read_change_config(&dir);
+        assert_eq!(config.depends_on, vec!["dep-a".to_string(), "dep-b".to_string()]);
+        assert_eq!(config.run_mode, RunMode::Apply);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_enter_on_dependency_item_loads_run_mode() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-dep-item-loads-mode");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("change-config.yaml"),
+            "depends_on:\n  - dep-one\nrun_mode: apply\n",
+        )
+        .unwrap();
+
+        let mut app = App {
+            screen: Screen::ArtifactMenu {
+                change_name: "my-change".to_string(),
+                change_dir: dir.clone(),
+                items: vec![ArtifactMenuItem {
+                    label: "Dependencies [1]".to_string(),
+                    available: true,
+                    file_path: None,
+                    is_spec_header: false,
+                    is_dependency_item: true,
+                }],
+                selected: 0,
+                is_archived: false,
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            launch_interactive: false,
+            implementation: None,
+            batch: None,
+            config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
+        };
+
+        app.handle_artifact_menu_input(KeyCode::Enter);
+
+        if let Screen::DependencyView { run_mode, dependencies, .. } = &app.screen {
+            assert_eq!(*run_mode, RunMode::Apply);
+            assert_eq!(dependencies, &vec!["dep-one".to_string()]);
+        } else {
+            panic!("Expected DependencyView screen");
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // Task 1.3: Tests for ArtifactView file_path
+
+    #[test]
+    fn test_artifact_view_constructed_with_file_path() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-artifact-view-filepath");
+        std::fs::create_dir_all(&dir).unwrap();
+        let proposal_path = dir.join("proposal.md");
+        std::fs::write(&proposal_path, "# Proposal\nContent here").unwrap();
+
+        let items = vec![ArtifactMenuItem {
+            label: "Proposal".to_string(),
+            available: true,
+            file_path: Some(proposal_path.clone()),
+            is_spec_header: false,
+            is_dependency_item: false,
+        }];
+
+        let mut app = App {
+            screen: Screen::ArtifactMenu {
+                change_name: "test-change".to_string(),
+                change_dir: dir.clone(),
+                items,
+                selected: 0,
+                is_archived: false,
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            launch_interactive: false,
+            implementation: None,
+            batch: None,
+            config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
+        };
+
+        app.handle_artifact_menu_input(KeyCode::Enter);
+
+        if let Screen::ArtifactView { file_path, .. } = &app.screen {
+            assert_eq!(*file_path, Some(proposal_path));
+        } else {
+            panic!("Expected ArtifactView screen");
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_artifact_view_log_has_file_path() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-log-filepath");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("implementation.log"), "log content").unwrap();
+
+        let mut app = App {
+            screen: Screen::ArtifactMenu {
+                change_name: "test-change".to_string(),
+                change_dir: dir.clone(),
+                items: vec![],
+                selected: 0,
+                is_archived: false,
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            launch_interactive: false,
+            implementation: None,
+            batch: None,
+            config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
+        };
+
+        app.handle_artifact_menu_input(KeyCode::Char('L'));
+
+        if let Screen::ArtifactView { file_path, .. } = &app.screen {
+            assert_eq!(*file_path, Some(dir.join("implementation.log")));
+        } else {
+            panic!("Expected ArtifactView screen after pressing L");
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // Task 2.9: Tests for refresh_screen()
+
+    #[test]
+    fn test_refresh_screen_artifact_view_reloads_content() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-refresh-artifact-view");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("test.md");
+        std::fs::write(&file, "original content").unwrap();
+
+        let mut app = App {
+            screen: Screen::ArtifactView {
+                title: "Test".to_string(),
+                content: "original content".to_string(),
+                scroll: 3,
+                is_plain_text: false,
+                file_path: Some(file.clone()),
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            launch_interactive: false,
+            implementation: None,
+            batch: None,
+            config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
+        };
+
+        // Modify file on disk
+        std::fs::write(&file, "updated content").unwrap();
+
+        app.refresh_screen();
+
+        if let Screen::ArtifactView { content, scroll, .. } = &app.screen {
+            assert_eq!(content, "updated content");
+            // Scroll position preserved
+            assert_eq!(*scroll, 3);
+        } else {
+            panic!("Expected ArtifactView screen");
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_refresh_screen_artifact_view_no_file_path_is_noop() {
+        let mut app = App {
+            screen: Screen::ArtifactView {
+                title: "Test".to_string(),
+                content: "original".to_string(),
+                scroll: 0,
+                is_plain_text: false,
+                file_path: None,
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            launch_interactive: false,
+            implementation: None,
+            batch: None,
+            config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
+        };
+
+        app.refresh_screen();
+
+        if let Screen::ArtifactView { content, .. } = &app.screen {
+            assert_eq!(content, "original");
+        } else {
+            panic!("Expected ArtifactView screen");
+        }
+    }
+
+    #[test]
+    fn test_refresh_screen_change_list_clamps_selection() {
+        // Start with a list of 3, selected at index 2
+        let mut app = App {
+            screen: Screen::ChangeList {
+                changes: vec![
+                    ChangeEntry { name: "a".to_string(), completed_tasks: 0, total_tasks: 1, status: "in-progress".to_string() },
+                    ChangeEntry { name: "b".to_string(), completed_tasks: 0, total_tasks: 1, status: "in-progress".to_string() },
+                    ChangeEntry { name: "c".to_string(), completed_tasks: 0, total_tasks: 1, status: "in-progress".to_string() },
+                ],
+                selected: 2,
+                error: None,
+                tab: ChangeTab::Active,
+                change_deps: HashMap::new(),
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            launch_interactive: false,
+            implementation: None,
+            batch: None,
+            config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
+        };
+
+        // After refresh, the real change list is loaded from the CLI.
+        // We can't control the external data, but we can verify the method
+        // doesn't panic and the selected index is valid.
+        app.refresh_screen();
+
+        if let Screen::ChangeList { selected, changes, .. } = &app.screen {
+            if !changes.is_empty() {
+                assert!(*selected < changes.len());
+            } else {
+                assert_eq!(*selected, 0);
+            }
+        } else {
+            panic!("Expected ChangeList screen");
+        }
+    }
+
+    #[test]
+    fn test_refresh_screen_config_is_noop() {
+        let mut app = App {
+            screen: Screen::Config {
+                command: "test-cmd".to_string(),
+                prompt: "test-prompt".to_string(),
+                post_implementation_prompt: "".to_string(),
+                interactive_command: "".to_string(),
+                cursor_position: 5,
+                focused_field: ConfigField::Command,
+                editing: false,
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            launch_interactive: false,
+            implementation: None,
+            batch: None,
+            config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
+        };
+
+        app.refresh_screen();
+
+        // Config screen should remain unchanged
+        if let Screen::Config { command, cursor_position, .. } = &app.screen {
+            assert_eq!(command, "test-cmd");
+            assert_eq!(*cursor_position, 5);
+        } else {
+            panic!("Expected Config screen");
+        }
+    }
+
+    #[test]
+    fn test_refresh_screen_dependency_view_reloads() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-refresh-depview");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Write a change-config.yaml with one dependency
+        std::fs::write(
+            dir.join("change-config.yaml"),
+            "depends_on:\n  - dep-a\n  - dep-b\nrun_mode: normal\n",
+        ).unwrap();
+
+        let mut app = App {
+            screen: Screen::DependencyView {
+                change_name: "test".to_string(),
+                change_dir: dir.clone(),
+                dependencies: vec!["old-dep".to_string()],
+                selected: 0,
+                run_mode: data::RunMode::Normal,
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            launch_interactive: false,
+            implementation: None,
+            batch: None,
+            config: TuiConfig::default(),
+            config_path: PathBuf::from("/tmp/openspec-tui-test-config.yaml"),
+        };
+
+        app.refresh_screen();
+
+        if let Screen::DependencyView { dependencies, .. } = &app.screen {
+            assert_eq!(dependencies, &vec!["dep-a".to_string(), "dep-b".to_string()]);
+        } else {
+            panic!("Expected DependencyView screen");
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

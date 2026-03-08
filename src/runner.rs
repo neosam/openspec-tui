@@ -223,6 +223,140 @@ fn write_run_header(log_path: &PathBuf, change_name: &str) -> Result<(), std::io
     Ok(())
 }
 
+/// Start an apply-mode runner for the given change.
+///
+/// Spawns a single subprocess that runs `/opsx:apply <name>` via the
+/// configured command. Output is redirected to `implementation.log`.
+/// No task tracking or stall detection — only a `Finished` message
+/// is sent when the process completes.
+pub fn start_apply(change_name: &str, config: &TuiConfig) -> ImplState {
+    let log_path = PathBuf::from("openspec/changes")
+        .join(change_name)
+        .join("implementation.log");
+
+    let (tx, rx) = mpsc::channel();
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let child_handle: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
+
+    let worker_cancel = cancel_flag.clone();
+    let worker_child = child_handle.clone();
+    let worker_log_path = log_path.clone();
+    let worker_change_name = change_name.to_string();
+    let worker_config = config.clone();
+
+    std::thread::spawn(move || {
+        apply_run(
+            &worker_change_name,
+            &worker_log_path,
+            &tx,
+            &worker_cancel,
+            &worker_child,
+            &worker_config,
+        );
+    });
+
+    ImplState {
+        change_name: change_name.to_string(),
+        completed: 0,
+        total: 0,
+        log_path,
+        receiver: rx,
+        cancel_flag,
+        child_handle,
+    }
+}
+
+fn apply_run(
+    change_name: &str,
+    log_path: &PathBuf,
+    tx: &mpsc::Sender<ImplUpdate>,
+    cancel_flag: &Arc<AtomicBool>,
+    child_handle: &Arc<Mutex<Option<Child>>>,
+    config: &TuiConfig,
+) {
+    let _ = write_run_header(log_path, change_name);
+
+    let prompt = format!("/opsx:apply {}", change_name);
+
+    let log_file = match OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+    {
+        Ok(f) => f,
+        Err(_) => {
+            let _ = tx.send(ImplUpdate::Finished { success: false });
+            return;
+        }
+    };
+    let stderr_log = match log_file.try_clone() {
+        Ok(f) => f,
+        Err(_) => {
+            let _ = tx.send(ImplUpdate::Finished { success: false });
+            return;
+        }
+    };
+
+    let child_result = match config.build_command(&prompt) {
+        Some((binary, args)) => std::process::Command::new(&binary)
+            .args(&args)
+            .stdout(Stdio::from(log_file))
+            .stderr(Stdio::from(stderr_log))
+            .spawn(),
+        None => {
+            let _ = tx.send(ImplUpdate::Finished { success: false });
+            return;
+        }
+    };
+
+    let child = match child_result {
+        Ok(c) => c,
+        Err(_) => {
+            let _ = tx.send(ImplUpdate::Finished { success: false });
+            return;
+        }
+    };
+
+    {
+        let mut handle = child_handle.lock().unwrap();
+        *handle = Some(child);
+    }
+
+    let exited_ok = loop {
+        if cancel_flag.load(Ordering::Relaxed) {
+            break false;
+        }
+
+        let try_result = {
+            let mut handle = child_handle.lock().unwrap();
+            if let Some(ref mut c) = *handle {
+                c.try_wait()
+            } else {
+                break false;
+            }
+        };
+
+        match try_result {
+            Ok(Some(status)) => break status.success(),
+            Ok(None) => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(_) => break false,
+        }
+    };
+
+    {
+        let mut handle = child_handle.lock().unwrap();
+        *handle = None;
+    }
+
+    if cancel_flag.load(Ordering::Relaxed) {
+        return;
+    }
+
+    let _ = tx.send(ImplUpdate::Finished { success: exited_ok });
+}
+
 /// Maximum consecutive runs with no task progress before aborting.
 const STALL_THRESHOLD: u32 = 3;
 
@@ -1419,5 +1553,222 @@ mod tests {
         let state = BatchImplState::new(vec!["a".to_string(), "b".to_string()], deps.clone());
 
         assert_eq!(state.deps, deps);
+    }
+
+    // --- start_apply tests ---
+
+    #[test]
+    fn test_start_apply_sets_log_path() {
+        let config = TuiConfig {
+            command: "echo {prompt}".to_string(),
+            ..Default::default()
+        };
+        let state = start_apply("my-change", &config);
+
+        assert_eq!(
+            state.log_path,
+            PathBuf::from("openspec/changes/my-change/implementation.log")
+        );
+        assert_eq!(state.change_name, "my-change");
+        assert_eq!(state.completed, 0);
+        assert_eq!(state.total, 0);
+    }
+
+    #[test]
+    fn test_start_apply_cancel_flag_works() {
+        let config = TuiConfig {
+            // Use sleep to keep process alive long enough to cancel
+            command: "sleep {prompt}".to_string(),
+            ..Default::default()
+        };
+        let state = start_apply("test-cancel-apply", &config);
+
+        // Cancel immediately
+        stop_implementation(&state);
+
+        // Should not receive any Progress or Stalled messages
+        let mut got_progress = false;
+        let mut got_stalled = false;
+        // Give thread a moment to finish
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        while let Ok(msg) = state.receiver.try_recv() {
+            match msg {
+                ImplUpdate::Progress { .. } => got_progress = true,
+                ImplUpdate::Stalled => got_stalled = true,
+                ImplUpdate::Finished { .. } => {}
+            }
+        }
+        assert!(!got_progress, "Apply mode should not send Progress");
+        assert!(!got_stalled, "Apply mode should not send Stalled");
+    }
+
+    #[test]
+    fn test_apply_run_sends_only_finished() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-apply-finished");
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join("implementation.log");
+
+        let config = TuiConfig {
+            command: "true {prompt}".to_string(),
+            ..Default::default()
+        };
+
+        let (tx, rx) = mpsc::channel();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let child_handle: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
+
+        apply_run(
+            "test-apply",
+            &log_path,
+            &tx,
+            &cancel_flag,
+            &child_handle,
+            &config,
+        );
+
+        let mut messages = vec![];
+        while let Ok(msg) = rx.try_recv() {
+            messages.push(msg);
+        }
+
+        // Should have exactly one Finished message, no Progress or Stalled
+        assert_eq!(messages.len(), 1, "Expected 1 message, got: {}", messages.len());
+        assert!(matches!(messages[0], ImplUpdate::Finished { success: true }));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_apply_run_no_progress_or_stalled() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-apply-no-progress");
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join("implementation.log");
+
+        // Use a command that fails
+        let config = TuiConfig {
+            command: "false {prompt}".to_string(),
+            ..Default::default()
+        };
+
+        let (tx, rx) = mpsc::channel();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let child_handle: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
+
+        apply_run(
+            "test-apply-fail",
+            &log_path,
+            &tx,
+            &cancel_flag,
+            &child_handle,
+            &config,
+        );
+
+        let mut messages = vec![];
+        while let Ok(msg) = rx.try_recv() {
+            messages.push(msg);
+        }
+
+        // Only Finished { success: false }, no Progress or Stalled
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(messages[0], ImplUpdate::Finished { success: false }));
+        assert!(!messages.iter().any(|m| matches!(m, ImplUpdate::Progress { .. })));
+        assert!(!messages.iter().any(|m| matches!(m, ImplUpdate::Stalled)));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_apply_run_writes_run_header() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-apply-header");
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join("implementation.log");
+
+        let config = TuiConfig {
+            command: "true {prompt}".to_string(),
+            ..Default::default()
+        };
+
+        let (tx, _rx) = mpsc::channel();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let child_handle: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
+
+        apply_run(
+            "test-apply-hdr",
+            &log_path,
+            &tx,
+            &cancel_flag,
+            &child_handle,
+            &config,
+        );
+
+        let content = std::fs::read_to_string(&log_path).unwrap();
+        assert!(content.contains("IMPLEMENTATION RUN STARTED"));
+        assert!(content.contains("Change: test-apply-hdr"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_apply_run_cancel_sends_nothing() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-apply-cancel");
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join("implementation.log");
+
+        let config = TuiConfig {
+            command: "sleep {prompt}".to_string(),
+            ..Default::default()
+        };
+
+        let (tx, rx) = mpsc::channel();
+        let cancel_flag = Arc::new(AtomicBool::new(true)); // Pre-set cancel
+        let child_handle: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
+
+        apply_run(
+            "test-apply-cancel",
+            &log_path,
+            &tx,
+            &cancel_flag,
+            &child_handle,
+            &config,
+        );
+
+        // Should not receive any messages when cancelled before spawn
+        let mut messages = vec![];
+        while let Ok(msg) = rx.try_recv() {
+            messages.push(msg);
+        }
+        assert!(messages.is_empty(), "Cancelled apply should send no messages");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_apply_run_empty_command_sends_finished_false() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-apply-empty-cmd");
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join("implementation.log");
+
+        let config = TuiConfig {
+            command: "".to_string(),
+            ..Default::default()
+        };
+
+        let (tx, rx) = mpsc::channel();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let child_handle: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
+
+        apply_run(
+            "test-apply-empty",
+            &log_path,
+            &tx,
+            &cancel_flag,
+            &child_handle,
+            &config,
+        );
+
+        let msg = rx.recv().unwrap();
+        assert!(matches!(msg, ImplUpdate::Finished { success: false }));
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
