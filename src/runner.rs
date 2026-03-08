@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 
+use crate::config::TuiConfig;
 use crate::data;
 
 /// Messages sent from the worker thread to the TUI.
@@ -39,10 +40,10 @@ pub fn stop_implementation(state: &ImplState) {
 /// Start an implementation runner for the given change.
 ///
 /// Spawns a worker thread that loops through unfinished tasks in tasks.md,
-/// invoking `claude --print --dangerously-skip-permissions` for each one.
-/// Claude output is redirected to a log file. Progress updates are sent
-/// via the mpsc channel stored in the returned `ImplState`.
-pub fn start_implementation(change_name: &str) -> ImplState {
+/// invoking the configured command for each one. Command and prompt are
+/// driven by `TuiConfig`. Output is redirected to a log file. Progress
+/// updates are sent via the mpsc channel stored in the returned `ImplState`.
+pub fn start_implementation(change_name: &str, config: &TuiConfig) -> ImplState {
     let tasks_path = PathBuf::from("openspec/changes")
         .join(change_name)
         .join("tasks.md");
@@ -61,6 +62,7 @@ pub fn start_implementation(change_name: &str) -> ImplState {
     let worker_child = child_handle.clone();
     let worker_log_path = log_path.clone();
     let worker_change_name = change_name.to_string();
+    let worker_config = config.clone();
 
     std::thread::spawn(move || {
         implementation_loop(
@@ -70,6 +72,7 @@ pub fn start_implementation(change_name: &str) -> ImplState {
             &tx,
             &worker_cancel,
             &worker_child,
+            &worker_config,
         );
     });
 
@@ -82,22 +85,6 @@ pub fn start_implementation(change_name: &str) -> ImplState {
         cancel_flag,
         child_handle,
     }
-}
-
-fn build_prompt(change_name: &str) -> String {
-    format!(
-        "Before implementing, read the following files for context:\n\
-         1. openspec/config.yaml — project context and conventions\n\
-         2. openspec/changes/{name}/proposal.md — change motivation and scope\n\
-         3. openspec/changes/{name}/design.md — architecture decisions\n\
-         4. openspec/changes/{name}/specs/ — detailed requirements\n\
-         5. openspec/specs/ — global project specifications\n\
-         \n\
-         Then read openspec/changes/{name}/tasks.md, take the next unfinished task, \
-         implement this task, verify if the changes are correct, \
-         and mark the task as completed.",
-        name = change_name
-    )
 }
 
 fn write_task_header(
@@ -137,6 +124,7 @@ fn implementation_loop(
     tx: &mpsc::Sender<ImplUpdate>,
     cancel_flag: &Arc<AtomicBool>,
     child_handle: &Arc<Mutex<Option<Child>>>,
+    config: &TuiConfig,
 ) {
     // Write run header before starting the task loop
     let _ = write_run_header(log_path, change_name);
@@ -180,14 +168,20 @@ fn implementation_loop(
             let _ = write_task_header(log_path, task_num, total, &task_text);
         }
 
-        let prompt = build_prompt(change_name);
+        let prompt = config.render_prompt(change_name);
 
-        // Spawn claude process
-        let child_result = data::claude_command()
-            .args(["--print", "--dangerously-skip-permissions", &prompt])
-            .stdout(Stdio::from(log_file))
-            .stderr(Stdio::from(stderr_log))
-            .spawn();
+        // Spawn process using config-driven command
+        let child_result = match config.build_command(&prompt) {
+            Some((binary, args)) => std::process::Command::new(&binary)
+                .args(&args)
+                .stdout(Stdio::from(log_file))
+                .stderr(Stdio::from(stderr_log))
+                .spawn(),
+            None => {
+                let _ = tx.send(ImplUpdate::Finished);
+                break;
+            }
+        };
 
         let child = match child_result {
             Ok(c) => c,
@@ -440,6 +434,7 @@ mod tests {
             &tx,
             &cancel_flag,
             &child_handle,
+            &TuiConfig::default(),
         );
 
         // The loop should not have sent any Progress message
@@ -477,6 +472,7 @@ mod tests {
             &tx,
             &cancel_flag,
             &child_handle,
+            &TuiConfig::default(),
         );
 
         // Should receive Finished since all tasks are complete
@@ -509,6 +505,7 @@ mod tests {
             &tx,
             &cancel_flag,
             &child_handle,
+            &TuiConfig::default(),
         );
 
         // Should receive Finished since claude spawn will fail in test environment
@@ -519,8 +516,9 @@ mod tests {
     }
 
     #[test]
-    fn test_prompt_contains_all_context_references() {
-        let prompt = build_prompt("my-change");
+    fn test_config_render_prompt_contains_all_context_references() {
+        let config = TuiConfig::default();
+        let prompt = config.render_prompt("my-change");
         assert!(
             prompt.contains("openspec/config.yaml"),
             "prompt should reference config.yaml"
@@ -546,8 +544,8 @@ mod tests {
             "prompt should reference tasks.md"
         );
         assert!(
-            !prompt.contains("Library-Constraints"),
-            "prompt should not contain hard-coded Library-Constraints"
+            !prompt.contains("{name}"),
+            "prompt should not contain unsubstituted {{name}} placeholder"
         );
     }
 
@@ -652,6 +650,7 @@ mod tests {
             &tx,
             &cancel_flag,
             &child_handle,
+            &TuiConfig::default(),
         );
 
         let content = std::fs::read_to_string(&log_path).unwrap();
@@ -729,6 +728,7 @@ mod tests {
             &tx,
             &cancel_flag,
             &child_handle,
+            &TuiConfig::default(),
         );
 
         let content = std::fs::read_to_string(&log_path).unwrap();
@@ -744,6 +744,89 @@ mod tests {
             content.contains("──"),
             "Task header should contain separator lines"
         );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_loop_uses_custom_config_command() {
+        // Configure a command that will fail (nonexistent binary), verify it
+        // attempts to use the configured command rather than hardcoded claude
+        let dir = std::env::temp_dir().join("openspec-tui-test-custom-cmd");
+        let change_dir = dir.join("openspec/changes/test-custom");
+        std::fs::create_dir_all(&change_dir).unwrap();
+        let tasks_path = change_dir.join("tasks.md");
+        std::fs::write(&tasks_path, "- [ ] Task one\n").unwrap();
+        let log_path = dir.join("test.log");
+
+        let config = TuiConfig {
+            command: "nonexistent-binary-xyz {prompt}".to_string(),
+            prompt: "custom prompt for {name}".to_string(),
+        };
+
+        let (tx, rx) = mpsc::channel();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let child_handle: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
+
+        implementation_loop(
+            "test-custom",
+            &tasks_path,
+            &log_path,
+            &tx,
+            &cancel_flag,
+            &child_handle,
+            &config,
+        );
+
+        // Should receive Finished since the nonexistent binary will fail to spawn
+        let msg = rx.recv().unwrap();
+        assert!(matches!(msg, ImplUpdate::Finished));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_loop_uses_custom_config_prompt() {
+        // Verify the config prompt template is used for substitution
+        let config = TuiConfig {
+            command: "echo {prompt}".to_string(),
+            prompt: "do something with {name} please".to_string(),
+        };
+        let rendered = config.render_prompt("my-feature");
+        assert_eq!(rendered, "do something with my-feature please");
+    }
+
+    #[test]
+    fn test_loop_finishes_when_command_empty() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-empty-cmd");
+        let change_dir = dir.join("openspec/changes/test-empty");
+        std::fs::create_dir_all(&change_dir).unwrap();
+        let tasks_path = change_dir.join("tasks.md");
+        std::fs::write(&tasks_path, "- [ ] Task one\n").unwrap();
+        let log_path = dir.join("test.log");
+
+        let config = TuiConfig {
+            command: "".to_string(),
+            prompt: "test {name}".to_string(),
+        };
+
+        let (tx, rx) = mpsc::channel();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let child_handle: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
+
+        implementation_loop(
+            "test-empty",
+            &tasks_path,
+            &log_path,
+            &tx,
+            &cancel_flag,
+            &child_handle,
+            &config,
+        );
+
+        // Should receive Finished since empty command returns None from build_command
+        let msg = rx.recv().unwrap();
+        assert!(matches!(msg, ImplUpdate::Finished));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

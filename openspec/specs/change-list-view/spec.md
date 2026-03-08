@@ -1,11 +1,11 @@
-## ADDED Requirements
+## MODIFIED Requirements
 
 ### Requirement: Display active changes on startup
-The system SHALL display a list of active openspec changes retrieved via `openspec list --json` when launched.
+The system SHALL display a list of active openspec changes retrieved via `openspec list --json` when launched, with a tab indicator showing the current view.
 
 #### Scenario: Changes exist
 - **WHEN** the TUI starts and `openspec list --json` returns one or more changes
-- **THEN** the system displays each change name in a selectable list
+- **THEN** the system displays each change name in a selectable list with the title showing `OpenSpec TUI [Active | Archived]` with Active highlighted
 
 #### Scenario: No changes exist
 - **WHEN** the TUI starts and `openspec list --json` returns an empty changes array
@@ -15,31 +15,23 @@ The system SHALL display a list of active openspec changes retrieved via `opensp
 - **WHEN** the TUI starts and the `openspec` command is not found on PATH
 - **THEN** the system displays an error message and exits
 
-### Requirement: Navigate the change list with keyboard
-The system SHALL allow the user to navigate the change list using arrow keys and j/k keys.
+## ADDED Requirements
 
-#### Scenario: Move selection down
-- **WHEN** the user presses the down arrow or `j` key
-- **THEN** the selection moves to the next change in the list
+### Requirement: Switch between Active and Archived tabs
+The system SHALL allow the user to switch between Active and Archived change lists using Left/Right arrow keys or h/l keys.
 
-#### Scenario: Move selection up
-- **WHEN** the user presses the up arrow or `k` key
-- **THEN** the selection moves to the previous change in the list
+#### Scenario: Switch to Archived tab
+- **WHEN** the user presses the Right arrow or `l` key on the Active tab
+- **THEN** the system switches to the Archived tab, loads archived changes, resets selection to 0, and updates the title to highlight Archived
 
-#### Scenario: Selection wrapping
-- **WHEN** the selection is at the last item and the user presses down
-- **THEN** the selection stays at the last item
+#### Scenario: Switch to Active tab
+- **WHEN** the user presses the Left arrow or `h` key on the Archived tab
+- **THEN** the system switches to the Active tab, loads active changes, resets selection to 0, and updates the title to highlight Active
 
-### Requirement: Select a change to view its artifacts
-The system SHALL navigate to the artifact menu when the user presses Enter on a selected change.
+#### Scenario: Already on leftmost tab
+- **WHEN** the user presses Left or `h` on the Active tab
+- **THEN** nothing happens (no wrap-around)
 
-#### Scenario: Enter on selected change
-- **WHEN** the user presses Enter on a highlighted change
-- **THEN** the system loads artifact status via `openspec status --change <name> --json` and shows the artifact menu
-
-### Requirement: Quit from change list
-The system SHALL exit when the user presses `q` from the change list screen.
-
-#### Scenario: Quit
-- **WHEN** the user presses `q` on the change list screen
-- **THEN** the TUI exits and restores the terminal to its original state
+#### Scenario: Already on rightmost tab
+- **WHEN** the user presses Right or `l` on the Archived tab
+- **THEN** nothing happens (no wrap-around)

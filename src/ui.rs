@@ -8,7 +8,7 @@ use ratatui::{
 
 use crate::runner::ImplState;
 
-use crate::app::{App, ChangeTab, Screen};
+use crate::app::{App, ChangeTab, ConfigField, Screen};
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let (content_area, status_area) = if let Some(ref impl_state) = app.implementation {
@@ -37,7 +37,15 @@ pub fn draw(frame: &mut Frame, app: &App) {
             title,
             content,
             scroll,
-        } => draw_artifact_view(frame, title, content, *scroll, content_area),
+            is_plain_text,
+        } => draw_artifact_view(frame, title, content, *scroll, *is_plain_text, content_area),
+        Screen::Config {
+            command,
+            prompt,
+            cursor_position,
+            focused_field,
+            editing,
+        } => draw_config_screen(frame, command, prompt, *cursor_position, focused_field, *editing, content_area),
     }
 }
 
@@ -129,6 +137,10 @@ fn draw_change_list(
     let list = List::new(items).block(
         Block::default()
             .title(title)
+            .title_bottom(Line::from(vec![
+                Span::styled(" [C] Config ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[q] Quit ", Style::default().fg(Color::DarkGray)),
+            ]))
             .borders(Borders::ALL),
     );
     frame.render_widget(list, area);
@@ -169,14 +181,24 @@ fn draw_artifact_menu(
     let list = List::new(list_items).block(
         Block::default()
             .title(format!(" {} - Artifacts ", change_name))
+            .title_bottom(Line::from(vec![
+                Span::styled(" [C] Config ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[R] Run ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[L] Log ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[Esc] Back ", Style::default().fg(Color::DarkGray)),
+            ]))
             .borders(Borders::ALL),
     );
     frame.render_widget(list, area);
 }
 
-pub fn draw_artifact_view(frame: &mut Frame, title: &str, content: &str, scroll: usize, area: Rect) {
+pub fn draw_artifact_view(frame: &mut Frame, title: &str, content: &str, scroll: usize, is_plain_text: bool, area: Rect) {
 
-    let text = tui_markdown::from_str(content);
+    let text = if is_plain_text {
+        ratatui::text::Text::from(content)
+    } else {
+        tui_markdown::from_str(content)
+    };
     let total_lines = text.lines.len();
 
     let paragraph = Paragraph::new(text)
@@ -190,9 +212,121 @@ pub fn draw_artifact_view(frame: &mut Frame, title: &str, content: &str, scroll:
                     scroll + 1,
                     total_lines
                 ))
+                .title_bottom(Line::from(vec![
+                    Span::styled(" [C] Config ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("[Esc] Back ", Style::default().fg(Color::DarkGray)),
+                ]))
                 .borders(Borders::ALL),
         );
     frame.render_widget(paragraph, area);
+}
+
+pub fn draw_config_screen(
+    frame: &mut Frame,
+    command: &str,
+    prompt: &str,
+    cursor_position: usize,
+    focused_field: &ConfigField,
+    editing: bool,
+    area: Rect,
+) {
+    let chunks = Layout::vertical([
+        Constraint::Length(3), // Command field
+        Constraint::Min(3),   // Prompt preview
+        Constraint::Length(1), // Keybinding hints
+    ])
+    .split(area);
+
+    // Command field
+    let cmd_style = if *focused_field == ConfigField::Command {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let cmd_block = Block::default()
+        .title(" Command ")
+        .borders(Borders::ALL)
+        .border_style(cmd_style);
+
+    let cmd_text = if editing && *focused_field == ConfigField::Command {
+        // Show cursor only in edit mode
+        let before = &command[..cursor_position];
+        let cursor_char = command.get(cursor_position..cursor_position + 1).unwrap_or(" ");
+        let after = if cursor_position < command.len() {
+            &command[cursor_position + 1..]
+        } else {
+            ""
+        };
+        Line::from(vec![
+            Span::raw(before),
+            Span::styled(
+                cursor_char,
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::White),
+            ),
+            Span::raw(after),
+        ])
+    } else {
+        Line::from(command)
+    };
+
+    let cmd_paragraph = Paragraph::new(cmd_text).block(cmd_block);
+    frame.render_widget(cmd_paragraph, chunks[0]);
+
+    // Prompt preview
+    let prompt_style = if *focused_field == ConfigField::Prompt {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let prompt_title = if *focused_field == ConfigField::Prompt {
+        " Prompt (Enter to edit in $EDITOR) "
+    } else {
+        " Prompt "
+    };
+    let prompt_block = Block::default()
+        .title(prompt_title)
+        .borders(Borders::ALL)
+        .border_style(prompt_style);
+
+    let prompt_text = prompt
+        .lines()
+        .map(|line| Line::from(line.to_string()))
+        .collect::<Vec<_>>();
+    let prompt_paragraph = Paragraph::new(prompt_text)
+        .wrap(Wrap { trim: false })
+        .block(prompt_block);
+    frame.render_widget(prompt_paragraph, chunks[1]);
+
+    // Warning if {prompt} is missing from command
+    let has_prompt_placeholder = command.contains("{prompt}");
+
+    // Keybinding hints
+    let mut hints = if editing {
+        vec![
+            Span::styled(" [Esc] Done editing ", Style::default().fg(Color::DarkGray)),
+        ]
+    } else {
+        vec![
+            Span::styled(" [Enter] Edit ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" [Tab] Switch field ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" [S] Save ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" [D] Reset defaults ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" [Esc] Cancel ", Style::default().fg(Color::DarkGray)),
+        ]
+    };
+
+    if !has_prompt_placeholder {
+        hints.push(Span::styled(
+            " ⚠ {prompt} missing in command! ",
+            Style::default().fg(Color::Red),
+        ));
+    }
+
+    let hints_line = Line::from(hints);
+    let hints_paragraph = Paragraph::new(hints_line);
+    frame.render_widget(hints_paragraph, chunks[2]);
 }
 
 pub fn draw_status_bar(frame: &mut Frame, impl_state: &ImplState, area: Rect) {
@@ -251,12 +385,16 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend, layout::Rect};
 
     fn render_artifact_view(width: u16, height: u16, content: &str, scroll: usize) -> String {
+        render_artifact_view_with_mode(width, height, content, scroll, false)
+    }
+
+    fn render_artifact_view_with_mode(width: u16, height: u16, content: &str, scroll: usize, is_plain_text: bool) -> String {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                draw_artifact_view(frame, "test", content, scroll, area);
+                draw_artifact_view(frame, "test", content, scroll, is_plain_text, area);
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -314,7 +452,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                draw_artifact_view(frame, "test", content, 0, area);
+                draw_artifact_view(frame, "test", content, 0, false, area);
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -345,7 +483,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                draw_artifact_view(frame, "test", content, 0, area);
+                draw_artifact_view(frame, "test", content, 0, false, area);
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -505,6 +643,7 @@ mod tests {
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: Some(make_impl_state("my-change", 2, 5)),
+            config: crate::config::TuiConfig::default(),
         };
 
         let rendered = render_draw(80, 14, &app);
@@ -531,6 +670,7 @@ mod tests {
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            config: crate::config::TuiConfig::default(),
         };
 
         let rendered = render_draw(60, 14, &app);
@@ -624,5 +764,229 @@ mod tests {
             rendered.contains("No archived changes found"),
             "Should show archived-specific empty message"
         );
+    }
+
+    #[test]
+    fn test_plain_text_preserves_single_newlines() {
+        let content = "line one\nline two\nline three";
+        let rendered = render_artifact_view_with_mode(40, 8, content, 0, true);
+        assert!(rendered.contains("line one"), "First line should be visible");
+        assert!(rendered.contains("line two"), "Second line should be visible");
+        assert!(rendered.contains("line three"), "Third line should be visible");
+    }
+
+    #[test]
+    fn test_plain_text_preserves_separator_lines() {
+        let content = "Header\n══════════════\nContent\n──────────────";
+        let rendered = render_artifact_view_with_mode(40, 8, content, 0, true);
+        assert!(rendered.contains("══════"), "Double-line separator should render verbatim");
+        assert!(rendered.contains("──────"), "Single-line separator should render verbatim");
+    }
+
+    #[test]
+    fn test_non_log_files_use_markdown_rendering() {
+        let content = "# Header\n\nBody text";
+        let rendered = render_artifact_view_with_mode(40, 8, content, 0, false);
+        assert!(rendered.contains("Header"), "Header text should be visible");
+        assert!(rendered.contains("Body text"), "Body text should be visible");
+
+        // Verify markdown formatting is applied (bold on header)
+        let backend = TestBackend::new(40, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_artifact_view(frame, "test", content, 0, false, area);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut found_bold = false;
+        for x in 0..40u16 {
+            let cell = buffer.cell((x, 1)).unwrap();
+            if cell.symbol() == "H" && cell.modifier.contains(Modifier::BOLD) {
+                found_bold = true;
+            }
+        }
+        assert!(found_bold, "Header should be bold in markdown mode");
+    }
+
+    fn render_config_screen(width: u16, height: u16, command: &str, prompt: &str, cursor_position: usize, focused_field: &ConfigField) -> String {
+        render_config_screen_with_editing(width, height, command, prompt, cursor_position, focused_field, false)
+    }
+
+    fn render_config_screen_with_editing(width: u16, height: u16, command: &str, prompt: &str, cursor_position: usize, focused_field: &ConfigField, editing: bool) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_config_screen(frame, command, prompt, cursor_position, focused_field, editing, area);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut lines = Vec::new();
+        for y in 0..height {
+            let mut line = String::new();
+            for x in 0..width {
+                line.push_str(buffer.cell((x, y)).unwrap().symbol());
+            }
+            lines.push(line.trim_end().to_string());
+        }
+        lines.join("\n")
+    }
+
+    #[test]
+    fn test_config_screen_shows_command() {
+        let rendered = render_config_screen(60, 15, "my-tool {prompt}", "my prompt", 0, &ConfigField::Command);
+        assert!(rendered.contains("my-tool"), "Command text should be visible");
+    }
+
+    #[test]
+    fn test_config_screen_shows_prompt() {
+        let rendered = render_config_screen(60, 15, "cmd {prompt}", "implement {name}", 0, &ConfigField::Command);
+        assert!(rendered.contains("implement"), "Prompt text should be visible");
+    }
+
+    #[test]
+    fn test_config_screen_shows_command_title() {
+        let rendered = render_config_screen(60, 15, "cmd {prompt}", "prompt", 0, &ConfigField::Command);
+        assert!(rendered.contains("Command"), "Command title should be visible");
+    }
+
+    #[test]
+    fn test_config_screen_shows_prompt_title() {
+        let rendered = render_config_screen(60, 15, "cmd {prompt}", "prompt", 0, &ConfigField::Command);
+        assert!(rendered.contains("Prompt"), "Prompt title should be visible");
+    }
+
+    #[test]
+    fn test_config_screen_shows_keybinding_hints() {
+        let rendered = render_config_screen(80, 15, "cmd {prompt}", "prompt", 0, &ConfigField::Command);
+        assert!(rendered.contains("[Tab]"), "Tab hint should be visible");
+        assert!(rendered.contains("[S] Save"), "Save hint should be visible");
+        assert!(rendered.contains("[Esc] Cancel"), "Cancel hint should be visible");
+        assert!(rendered.contains("[D] Reset"), "Reset hint should be visible");
+    }
+
+    #[test]
+    fn test_config_screen_warns_missing_prompt_placeholder() {
+        let rendered = render_config_screen(100, 15, "cmd --flag", "prompt", 0, &ConfigField::Command);
+        assert!(rendered.contains("missing"), "Warning should show when {{prompt}} is missing");
+    }
+
+    #[test]
+    fn test_config_screen_no_warning_with_prompt_placeholder() {
+        let rendered = render_config_screen(100, 15, "cmd {prompt}", "prompt", 0, &ConfigField::Command);
+        assert!(!rendered.contains("missing"), "No warning when {{prompt}} is present");
+    }
+
+    #[test]
+    fn test_config_screen_shows_editor_hint_when_prompt_focused() {
+        let rendered = render_config_screen(80, 15, "cmd {prompt}", "prompt", 0, &ConfigField::Prompt);
+        assert!(rendered.contains("$EDITOR"), "Editor hint should show when prompt is focused");
+    }
+
+    #[test]
+    fn test_draw_full_app_with_config_screen() {
+        let app = crate::app::App {
+            screen: crate::app::Screen::Config {
+                command: "claude --print {prompt}".to_string(),
+                prompt: "implement {name}".to_string(),
+                cursor_position: 0,
+                focused_field: ConfigField::Command,
+                editing: false,
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: None,
+            config: crate::config::TuiConfig::default(),
+        };
+        let rendered = render_draw(60, 15, &app);
+        assert!(rendered.contains("Command"), "Config screen should render in draw()");
+        assert!(rendered.contains("claude"), "Command text should be visible");
+    }
+
+    #[test]
+    fn test_config_screen_no_cursor_in_navigation_mode() {
+        // In navigation mode (editing=false), no block cursor should be shown
+        let backend = TestBackend::new(60, 15);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_config_screen(frame, "cmd {prompt}", "prompt", 0, &ConfigField::Command, false, area);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        // In navigation mode, no cell in the command row should have bg=White (cursor indicator)
+        let mut found_cursor = false;
+        for x in 0..60u16 {
+            let cell = buffer.cell((x, 1)).unwrap(); // row 1 is inside the Command block
+            if cell.bg == Color::White {
+                found_cursor = true;
+            }
+        }
+        assert!(!found_cursor, "No cursor should be visible in navigation mode");
+    }
+
+    #[test]
+    fn test_config_screen_cursor_visible_in_edit_mode() {
+        let backend = TestBackend::new(60, 15);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_config_screen(frame, "cmd {prompt}", "prompt", 0, &ConfigField::Command, true, area);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        // In edit mode, a cell in the command row should have bg=White (cursor indicator)
+        let mut found_cursor = false;
+        for x in 0..60u16 {
+            let cell = buffer.cell((x, 1)).unwrap();
+            if cell.bg == Color::White {
+                found_cursor = true;
+            }
+        }
+        assert!(found_cursor, "Cursor should be visible in edit mode");
+    }
+
+    #[test]
+    fn test_config_screen_navigation_hints() {
+        let rendered = render_config_screen_with_editing(
+            100, 15, "cmd {prompt}", "prompt", 0, &ConfigField::Command, false,
+        );
+        assert!(rendered.contains("[Enter] Edit"), "Enter hint should show in navigation mode");
+        assert!(rendered.contains("[Tab]"), "Tab hint should show in navigation mode");
+        assert!(rendered.contains("[S] Save"), "Save hint should show in navigation mode");
+        assert!(rendered.contains("[D] Reset"), "Reset hint should show in navigation mode");
+        assert!(rendered.contains("[Esc] Cancel"), "Cancel hint should show in navigation mode");
+        assert!(!rendered.contains("Done editing"), "Edit-mode hint should not show in navigation mode");
+    }
+
+    #[test]
+    fn test_config_screen_edit_mode_hints() {
+        let rendered = render_config_screen_with_editing(
+            100, 15, "cmd {prompt}", "prompt", 0, &ConfigField::Command, true,
+        );
+        assert!(rendered.contains("[Esc] Done editing"), "Done editing hint should show in edit mode");
+        assert!(!rendered.contains("[S] Save"), "Save hint should not show in edit mode");
+        assert!(!rendered.contains("[D] Reset"), "Reset hint should not show in edit mode");
+        assert!(!rendered.contains("[Enter] Edit"), "Enter-edit hint should not show in edit mode");
+    }
+
+    #[test]
+    fn test_config_screen_prompt_warning_in_both_modes() {
+        // Navigation mode without {prompt}
+        let rendered_nav = render_config_screen_with_editing(
+            100, 15, "cmd --flag", "prompt", 0, &ConfigField::Command, false,
+        );
+        assert!(rendered_nav.contains("missing"), "Warning should show in navigation mode");
+
+        // Edit mode without {prompt}
+        let rendered_edit = render_config_screen_with_editing(
+            100, 15, "cmd --flag", "prompt", 0, &ConfigField::Command, true,
+        );
+        assert!(rendered_edit.contains("missing"), "Warning should show in edit mode");
     }
 }

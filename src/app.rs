@@ -1,6 +1,7 @@
 use crossterm::event::KeyCode;
 use std::path::PathBuf;
 
+use crate::config::TuiConfig;
 use crate::data::{self, ChangeEntry, ChangeStatusOutput};
 use crate::runner::{self, stop_implementation, ImplState};
 #[cfg(test)]
@@ -10,6 +11,12 @@ use crate::data::ArtifactStatus;
 pub enum ChangeTab {
     Active,
     Archived,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConfigField {
+    Command,
+    Prompt,
 }
 
 #[derive(Debug, Clone)]
@@ -31,6 +38,14 @@ pub enum Screen {
         title: String,
         content: String,
         scroll: usize,
+        is_plain_text: bool,
+    },
+    Config {
+        command: String,
+        prompt: String,
+        cursor_position: usize,
+        focused_field: ConfigField,
+        editing: bool,
     },
 }
 
@@ -47,6 +62,7 @@ pub struct App {
     pub screen_stack: Vec<Screen>,
     pub should_quit: bool,
     pub implementation: Option<ImplState>,
+    pub config: TuiConfig,
 }
 
 impl App {
@@ -66,11 +82,14 @@ impl App {
             },
         };
 
+        let config = TuiConfig::load()?;
+
         Ok(App {
             screen,
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            config,
         })
     }
 
@@ -164,6 +183,9 @@ impl App {
                 let is_archived = *tab == ChangeTab::Archived;
                 self.enter_artifact_menu(&change_name, is_archived);
             }
+            KeyCode::Char('C') => {
+                self.push_config_screen();
+            }
             _ => {}
         }
     }
@@ -242,6 +264,7 @@ impl App {
                     let title = item.label.clone();
                     let content = data::read_artifact_content(path)
                         .unwrap_or_else(|e| format!("Error reading file: {e}"));
+                    let is_plain_text = path.extension().is_some_and(|ext| ext == "log");
                     let change_dir = change_dir.clone();
                     let old_screen = std::mem::replace(
                         &mut self.screen,
@@ -249,17 +272,51 @@ impl App {
                             title,
                             content,
                             scroll: 0,
+                            is_plain_text,
                         },
                     );
                     let _ = change_dir;
                     self.screen_stack.push(old_screen);
                 }
             }
+            KeyCode::Char('L') => {
+                let log_path = change_dir.join("implementation.log");
+                if log_path.exists() {
+                    let content = data::read_artifact_content(&log_path)
+                        .unwrap_or_else(|e| format!("Error reading file: {e}"));
+                    let old_screen = std::mem::replace(
+                        &mut self.screen,
+                        Screen::ArtifactView {
+                            title: "Implementation Log".to_string(),
+                            content,
+                            scroll: 0,
+                            is_plain_text: true,
+                        },
+                    );
+                    self.screen_stack.push(old_screen);
+                }
+            }
             KeyCode::Char('R') => {
                 if !*is_archived && self.implementation.is_none() {
                     let name = change_name.clone();
-                    self.implementation = Some(runner::start_implementation(&name));
+                    let log_path = change_dir.clone().join("implementation.log");
+                    self.implementation = Some(runner::start_implementation(&name, &self.config));
+                    let content = data::read_artifact_content(&log_path)
+                        .unwrap_or_default();
+                    let old_screen = std::mem::replace(
+                        &mut self.screen,
+                        Screen::ArtifactView {
+                            title: "Implementation Log".to_string(),
+                            content,
+                            scroll: 0,
+                            is_plain_text: true,
+                        },
+                    );
+                    self.screen_stack.push(old_screen);
                 }
+            }
+            KeyCode::Char('C') => {
+                self.push_config_screen();
             }
             KeyCode::Esc => {
                 if let Some(prev) = self.screen_stack.pop() {
@@ -267,6 +324,133 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    pub fn push_config_screen(&mut self) {
+        let old_screen = std::mem::replace(
+            &mut self.screen,
+            Screen::Config {
+                command: self.config.command.clone(),
+                prompt: self.config.prompt.clone(),
+                cursor_position: self.config.command.len(),
+                focused_field: ConfigField::Command,
+                editing: false,
+            },
+        );
+        self.screen_stack.push(old_screen);
+    }
+
+    /// Handle input on the Config screen. Returns `true` if the caller
+    /// should open `$EDITOR` for the prompt field (Enter on Prompt).
+    pub fn handle_config_input(&mut self, key: KeyCode) -> bool {
+        let Screen::Config {
+            command,
+            prompt,
+            cursor_position,
+            focused_field,
+            editing,
+        } = &mut self.screen
+        else {
+            return false;
+        };
+
+        if *editing {
+            // Edit mode (Command field only)
+            match key {
+                KeyCode::Esc | KeyCode::Enter => {
+                    *editing = false;
+                }
+                KeyCode::Char(c) => {
+                    command.insert(*cursor_position, c);
+                    *cursor_position += 1;
+                }
+                KeyCode::Backspace => {
+                    if *cursor_position > 0 {
+                        *cursor_position -= 1;
+                        command.remove(*cursor_position);
+                    }
+                }
+                KeyCode::Delete => {
+                    if *cursor_position < command.len() {
+                        command.remove(*cursor_position);
+                    }
+                }
+                KeyCode::Left => {
+                    if *cursor_position > 0 {
+                        *cursor_position -= 1;
+                    }
+                }
+                KeyCode::Right => {
+                    if *cursor_position < command.len() {
+                        *cursor_position += 1;
+                    }
+                }
+                KeyCode::Home => {
+                    *cursor_position = 0;
+                }
+                KeyCode::End => {
+                    *cursor_position = command.len();
+                }
+                _ => {}
+            }
+        } else {
+            // Navigation mode
+            match key {
+                KeyCode::Tab | KeyCode::BackTab => {
+                    *focused_field = match focused_field {
+                        ConfigField::Command => ConfigField::Prompt,
+                        ConfigField::Prompt => ConfigField::Command,
+                    };
+                    if *focused_field == ConfigField::Command {
+                        *cursor_position = command.len();
+                    }
+                }
+                KeyCode::Esc => {
+                    // Discard changes and return to previous screen
+                    if let Some(prev) = self.screen_stack.pop() {
+                        self.screen = prev;
+                    }
+                }
+                KeyCode::Enter => {
+                    if *focused_field == ConfigField::Command {
+                        *cursor_position = command.len();
+                        *editing = true;
+                    } else {
+                        // Prompt field: signal caller to open $EDITOR
+                        return true;
+                    }
+                }
+                KeyCode::Char('S') => {
+                    // Save config and return
+                    let new_config = TuiConfig {
+                        command: command.clone(),
+                        prompt: prompt.clone(),
+                    };
+                    let _ = new_config.save();
+                    self.config = new_config;
+                    if let Some(prev) = self.screen_stack.pop() {
+                        self.screen = prev;
+                    }
+                }
+                KeyCode::Char('D') => {
+                    // Reset to defaults
+                    let defaults = TuiConfig::default();
+                    *command = defaults.command;
+                    *prompt = defaults.prompt;
+                    *cursor_position = command.len();
+                    *focused_field = ConfigField::Command;
+                }
+                _ => {} // Character keys ignored in navigation mode
+            }
+        }
+        false
+    }
+
+    /// Update the prompt text on the Config screen (called after $EDITOR exits).
+    pub fn set_config_prompt(&mut self, new_prompt: String) {
+        if let Screen::Config { prompt, .. } = &mut self.screen {
+            *prompt = new_prompt;
         }
     }
 
@@ -290,6 +474,9 @@ impl App {
                 if *scroll > 0 {
                     *scroll -= 1;
                 }
+            }
+            KeyCode::Char('C') => {
+                self.push_config_screen();
             }
             KeyCode::Esc => {
                 if let Some(prev) = self.screen_stack.pop() {
@@ -405,6 +592,7 @@ mod tests {
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            config: TuiConfig::default(),
         };
 
         // Pressing Esc on ChangeList shouldn't crash (no parent screen)
@@ -432,6 +620,7 @@ mod tests {
             screen_stack: vec![original_screen],
             should_quit: false,
             implementation: None,
+            config: TuiConfig::default(),
         };
 
         app.handle_artifact_menu_input(KeyCode::Esc);
@@ -454,10 +643,12 @@ mod tests {
                 title: "Proposal".to_string(),
                 content: "hello\nworld".to_string(),
                 scroll: 0,
+                is_plain_text: false,
             },
             screen_stack: vec![menu_screen],
             should_quit: false,
             implementation: None,
+            config: TuiConfig::default(),
         };
 
         app.handle_artifact_view_input(KeyCode::Esc);
@@ -495,6 +686,7 @@ mod tests {
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            config: TuiConfig::default(),
         };
 
         // Move down
@@ -540,10 +732,12 @@ mod tests {
                 title: "Test".to_string(),
                 content: "line1\nline2\nline3\nline4\nline5".to_string(),
                 scroll: 0,
+                is_plain_text: false,
             },
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            config: TuiConfig::default(),
         };
 
         // Scroll down
@@ -609,6 +803,7 @@ mod tests {
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            config: TuiConfig::default(),
         };
 
         app.handle_artifact_menu_input(KeyCode::Down);
@@ -678,6 +873,7 @@ mod tests {
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            config: TuiConfig::default(),
         };
 
         app.handle_artifact_menu_input(KeyCode::Enter);
@@ -703,6 +899,7 @@ mod tests {
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            config: TuiConfig::default(),
         };
 
         app.handle_artifact_menu_input(KeyCode::Enter);
@@ -722,6 +919,7 @@ mod tests {
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            config: TuiConfig::default(),
         };
 
         assert!(app.implementation.is_none());
@@ -760,6 +958,7 @@ mod tests {
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: Some(existing_impl),
+            config: TuiConfig::default(),
         };
 
         app.handle_artifact_menu_input(KeyCode::Char('R'));
@@ -798,6 +997,7 @@ mod tests {
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: Some(existing_impl),
+            config: TuiConfig::default(),
         };
 
         assert!(app.implementation.is_some());
@@ -818,6 +1018,7 @@ mod tests {
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            config: TuiConfig::default(),
         };
 
         // Should not panic when no implementation is running
@@ -848,10 +1049,12 @@ mod tests {
                 title: "Test".to_string(),
                 content: "content".to_string(),
                 scroll: 0,
+                is_plain_text: false,
             },
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: Some(existing_impl),
+            config: TuiConfig::default(),
         };
 
         app.stop_running_implementation();
@@ -890,6 +1093,7 @@ mod tests {
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: Some(existing_impl),
+            config: TuiConfig::default(),
         };
 
         app.stop_running_implementation();
@@ -925,6 +1129,7 @@ mod tests {
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: Some(impl_state),
+            config: TuiConfig::default(),
         };
 
         // Send progress updates
@@ -973,6 +1178,7 @@ mod tests {
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: Some(impl_state),
+            config: TuiConfig::default(),
         };
 
         tx.send(crate::runner::ImplUpdate::Finished).unwrap();
@@ -1008,6 +1214,7 @@ mod tests {
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: Some(impl_state),
+            config: TuiConfig::default(),
         };
 
         // Send progress then finished
@@ -1036,6 +1243,7 @@ mod tests {
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            config: TuiConfig::default(),
         };
 
         // Should not panic
@@ -1069,6 +1277,7 @@ mod tests {
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: Some(impl_state),
+            config: TuiConfig::default(),
         };
 
         app.poll_implementation();
@@ -1139,6 +1348,7 @@ mod tests {
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            config: TuiConfig::default(),
         };
 
         // Navigation on empty list shouldn't panic
@@ -1165,6 +1375,7 @@ mod tests {
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            config: TuiConfig::default(),
         };
 
         app.handle_change_list_input(KeyCode::Right);
@@ -1188,6 +1399,7 @@ mod tests {
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            config: TuiConfig::default(),
         };
 
         app.handle_change_list_input(KeyCode::Left);
@@ -1215,6 +1427,7 @@ mod tests {
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            config: TuiConfig::default(),
         };
 
         app.handle_change_list_input(KeyCode::Left);
@@ -1240,6 +1453,7 @@ mod tests {
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            config: TuiConfig::default(),
         };
 
         app.handle_change_list_input(KeyCode::Right);
@@ -1262,6 +1476,7 @@ mod tests {
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            config: TuiConfig::default(),
         };
 
         // Switch to archived with 'l'
@@ -1302,6 +1517,7 @@ mod tests {
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            config: TuiConfig::default(),
         };
 
         app.handle_change_list_input(KeyCode::Right);
@@ -1323,6 +1539,7 @@ mod tests {
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            config: TuiConfig::default(),
         };
 
         app.handle_artifact_menu_input(KeyCode::Char('R'));
@@ -1345,6 +1562,7 @@ mod tests {
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            config: TuiConfig::default(),
         };
 
         app.handle_artifact_menu_input(KeyCode::Char('R'));
@@ -1366,6 +1584,7 @@ mod tests {
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            config: TuiConfig::default(),
         };
 
         let dir = app.find_change_dir("my-change", false);
@@ -1385,9 +1604,633 @@ mod tests {
             screen_stack: Vec::new(),
             should_quit: false,
             implementation: None,
+            config: TuiConfig::default(),
         };
 
         let dir = app.find_change_dir("2026-03-06-my-change", true);
         assert!(dir.ends_with("openspec/changes/archive/2026-03-06-my-change"));
+    }
+
+    #[test]
+    fn test_l_key_opens_log_when_exists() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-l-key");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("implementation.log"), "log line 1\nlog line 2").unwrap();
+
+        let mut app = App {
+            screen: Screen::ArtifactMenu {
+                change_name: "test-change".to_string(),
+                change_dir: dir.clone(),
+                items: vec![],
+                selected: 0,
+                is_archived: false,
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: None,
+            config: TuiConfig::default(),
+        };
+
+        app.handle_artifact_menu_input(KeyCode::Char('L'));
+
+        if let Screen::ArtifactView {
+            title,
+            content,
+            is_plain_text,
+            ..
+        } = &app.screen
+        {
+            assert_eq!(title, "Implementation Log");
+            assert!(content.contains("log line 1"));
+            assert!(*is_plain_text);
+        } else {
+            panic!("Expected ArtifactView screen after pressing L");
+        }
+        assert_eq!(app.screen_stack.len(), 1);
+        assert!(matches!(app.screen_stack[0], Screen::ArtifactMenu { .. }));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_l_key_noop_when_log_missing() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-l-key-noop");
+        std::fs::create_dir_all(&dir).unwrap();
+        // No implementation.log created
+
+        let mut app = App {
+            screen: Screen::ArtifactMenu {
+                change_name: "test-change".to_string(),
+                change_dir: dir.clone(),
+                items: vec![],
+                selected: 0,
+                is_archived: false,
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: None,
+            config: TuiConfig::default(),
+        };
+
+        app.handle_artifact_menu_input(KeyCode::Char('L'));
+
+        assert!(
+            matches!(app.screen, Screen::ArtifactMenu { .. }),
+            "Screen should remain ArtifactMenu when log does not exist"
+        );
+        assert!(app.screen_stack.is_empty());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_l_key_works_for_archived_changes() {
+        let dir = std::env::temp_dir().join("openspec-tui-test-l-key-archived");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("implementation.log"), "archived log").unwrap();
+
+        let mut app = App {
+            screen: Screen::ArtifactMenu {
+                change_name: "archived-change".to_string(),
+                change_dir: dir.clone(),
+                items: vec![],
+                selected: 0,
+                is_archived: true,
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: None,
+            config: TuiConfig::default(),
+        };
+
+        app.handle_artifact_menu_input(KeyCode::Char('L'));
+
+        if let Screen::ArtifactView {
+            content,
+            is_plain_text,
+            ..
+        } = &app.screen
+        {
+            assert!(content.contains("archived log"));
+            assert!(*is_plain_text);
+        } else {
+            panic!("Expected ArtifactView screen after pressing L on archived change");
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_r_key_navigates_to_log_view() {
+        let mut app = App {
+            screen: Screen::ArtifactMenu {
+                change_name: "active-change".to_string(),
+                change_dir: PathBuf::from("/tmp"),
+                items: vec![],
+                selected: 0,
+                is_archived: false,
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: None,
+            config: TuiConfig::default(),
+        };
+
+        app.handle_artifact_menu_input(KeyCode::Char('R'));
+
+        // Runner should have started
+        assert!(app.implementation.is_some());
+        // Should navigate to ArtifactView with plain text
+        if let Screen::ArtifactView {
+            title,
+            is_plain_text,
+            ..
+        } = &app.screen
+        {
+            assert_eq!(title, "Implementation Log");
+            assert!(*is_plain_text);
+        } else {
+            panic!("Expected ArtifactView after pressing R");
+        }
+        // Previous screen should be on the stack
+        assert_eq!(app.screen_stack.len(), 1);
+        assert!(matches!(app.screen_stack[0], Screen::ArtifactMenu { .. }));
+    }
+
+    #[test]
+    fn test_r_key_esc_returns_to_artifact_menu() {
+        let mut app = App {
+            screen: Screen::ArtifactMenu {
+                change_name: "active-change".to_string(),
+                change_dir: PathBuf::from("/tmp"),
+                items: vec![],
+                selected: 0,
+                is_archived: false,
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: None,
+            config: TuiConfig::default(),
+        };
+
+        app.handle_artifact_menu_input(KeyCode::Char('R'));
+        assert!(matches!(app.screen, Screen::ArtifactView { .. }));
+
+        // Press Esc to go back
+        app.handle_artifact_view_input(KeyCode::Esc);
+        assert!(
+            matches!(app.screen, Screen::ArtifactMenu { .. }),
+            "Esc should return to ArtifactMenu"
+        );
+    }
+
+    // --- Config screen tests ---
+
+    fn make_config_app() -> App {
+        App {
+            screen: Screen::ChangeList {
+                changes: vec![],
+                selected: 0,
+                error: None,
+                tab: ChangeTab::Active,
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: None,
+            config: TuiConfig {
+                command: "test-tool {prompt}".to_string(),
+                prompt: "test prompt {name}".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn test_c_key_pushes_config_screen_from_change_list() {
+        let mut app = make_config_app();
+        app.handle_change_list_input(KeyCode::Char('C'));
+        assert!(matches!(app.screen, Screen::Config { .. }));
+        assert_eq!(app.screen_stack.len(), 1);
+        assert!(matches!(app.screen_stack[0], Screen::ChangeList { .. }));
+    }
+
+    #[test]
+    fn test_c_key_pushes_config_screen_from_artifact_menu() {
+        let mut app = App {
+            screen: Screen::ArtifactMenu {
+                change_name: "test".to_string(),
+                change_dir: PathBuf::from("/tmp"),
+                items: vec![],
+                selected: 0,
+                is_archived: false,
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: None,
+            config: TuiConfig::default(),
+        };
+        app.handle_artifact_menu_input(KeyCode::Char('C'));
+        assert!(matches!(app.screen, Screen::Config { .. }));
+    }
+
+    #[test]
+    fn test_c_key_pushes_config_screen_from_artifact_view() {
+        let mut app = App {
+            screen: Screen::ArtifactView {
+                title: "Test".to_string(),
+                content: "content".to_string(),
+                scroll: 0,
+                is_plain_text: false,
+            },
+            screen_stack: Vec::new(),
+            should_quit: false,
+            implementation: None,
+            config: TuiConfig::default(),
+        };
+        app.handle_artifact_view_input(KeyCode::Char('C'));
+        assert!(matches!(app.screen, Screen::Config { .. }));
+    }
+
+    #[test]
+    fn test_config_screen_has_cloned_config_values() {
+        let mut app = make_config_app();
+        app.push_config_screen();
+        if let Screen::Config { command, prompt, .. } = &app.screen {
+            assert_eq!(command, "test-tool {prompt}");
+            assert_eq!(prompt, "test prompt {name}");
+        } else {
+            panic!("Expected Config screen");
+        }
+    }
+
+    #[test]
+    fn test_config_screen_cursor_starts_at_end() {
+        let mut app = make_config_app();
+        app.push_config_screen();
+        if let Screen::Config { cursor_position, command, .. } = &app.screen {
+            assert_eq!(*cursor_position, command.len());
+        } else {
+            panic!("Expected Config screen");
+        }
+    }
+
+    #[test]
+    fn test_config_screen_focused_on_command() {
+        let mut app = make_config_app();
+        app.push_config_screen();
+        if let Screen::Config { focused_field, .. } = &app.screen {
+            assert_eq!(*focused_field, ConfigField::Command);
+        } else {
+            panic!("Expected Config screen");
+        }
+    }
+
+    #[test]
+    fn test_config_esc_discards_changes() {
+        let mut app = make_config_app();
+        app.push_config_screen();
+
+        // Type a character
+        app.handle_config_input(KeyCode::Char('X'));
+
+        // Press Esc to discard
+        app.handle_config_input(KeyCode::Esc);
+        assert!(matches!(app.screen, Screen::ChangeList { .. }));
+        // Original config should be unchanged
+        assert_eq!(app.config.command, "test-tool {prompt}");
+    }
+
+    #[test]
+    fn test_config_tab_switches_focus() {
+        let mut app = make_config_app();
+        app.push_config_screen();
+
+        // Start on Command
+        if let Screen::Config { focused_field, .. } = &app.screen {
+            assert_eq!(*focused_field, ConfigField::Command);
+        }
+
+        // Tab -> Prompt
+        app.handle_config_input(KeyCode::Tab);
+        if let Screen::Config { focused_field, .. } = &app.screen {
+            assert_eq!(*focused_field, ConfigField::Prompt);
+        }
+
+        // Tab -> Command
+        app.handle_config_input(KeyCode::Tab);
+        if let Screen::Config { focused_field, .. } = &app.screen {
+            assert_eq!(*focused_field, ConfigField::Command);
+        }
+    }
+
+    #[test]
+    fn test_config_typing_in_command_field() {
+        let mut app = make_config_app();
+        app.push_config_screen();
+
+        // Enter edit mode, then move cursor to beginning
+        app.handle_config_input(KeyCode::Enter);
+        app.handle_config_input(KeyCode::Home);
+        // Type characters
+        app.handle_config_input(KeyCode::Char('A'));
+        app.handle_config_input(KeyCode::Char('B'));
+
+        if let Screen::Config { command, cursor_position, .. } = &app.screen {
+            assert_eq!(command, "ABtest-tool {prompt}");
+            assert_eq!(*cursor_position, 2);
+        } else {
+            panic!("Expected Config screen");
+        }
+    }
+
+    #[test]
+    fn test_config_backspace_in_command_field() {
+        let mut app = make_config_app();
+        app.push_config_screen();
+
+        // Enter edit mode, then backspace deletes last char
+        app.handle_config_input(KeyCode::Enter);
+        app.handle_config_input(KeyCode::Backspace);
+        if let Screen::Config { command, .. } = &app.screen {
+            assert_eq!(command, "test-tool {prompt");
+        }
+    }
+
+    #[test]
+    fn test_config_delete_in_command_field() {
+        let mut app = make_config_app();
+        app.push_config_screen();
+
+        // Enter edit mode, move to start, delete first char
+        app.handle_config_input(KeyCode::Enter);
+        app.handle_config_input(KeyCode::Home);
+        app.handle_config_input(KeyCode::Delete);
+        if let Screen::Config { command, .. } = &app.screen {
+            assert_eq!(command, "est-tool {prompt}");
+        }
+    }
+
+    #[test]
+    fn test_config_cursor_movement() {
+        let mut app = make_config_app();
+        app.push_config_screen();
+
+        let cmd_len = if let Screen::Config { command, .. } = &app.screen {
+            command.len()
+        } else {
+            0
+        };
+
+        // Enter edit mode first
+        app.handle_config_input(KeyCode::Enter);
+
+        // Home -> cursor at 0
+        app.handle_config_input(KeyCode::Home);
+        if let Screen::Config { cursor_position, .. } = &app.screen {
+            assert_eq!(*cursor_position, 0);
+        }
+
+        // Right -> cursor at 1
+        app.handle_config_input(KeyCode::Right);
+        if let Screen::Config { cursor_position, .. } = &app.screen {
+            assert_eq!(*cursor_position, 1);
+        }
+
+        // End -> cursor at end
+        app.handle_config_input(KeyCode::End);
+        if let Screen::Config { cursor_position, .. } = &app.screen {
+            assert_eq!(*cursor_position, cmd_len);
+        }
+
+        // Left -> cursor at end - 1
+        app.handle_config_input(KeyCode::Left);
+        if let Screen::Config { cursor_position, .. } = &app.screen {
+            assert_eq!(*cursor_position, cmd_len - 1);
+        }
+    }
+
+    #[test]
+    fn test_config_save_updates_app_config() {
+        let mut app = make_config_app();
+        app.push_config_screen();
+
+        // Enter edit mode, modify command
+        app.handle_config_input(KeyCode::Enter);
+        app.handle_config_input(KeyCode::Home);
+        app.handle_config_input(KeyCode::Char('X'));
+
+        // Return to navigation mode
+        app.handle_config_input(KeyCode::Esc);
+
+        // Save (S works in navigation mode regardless of focused field)
+        app.handle_config_input(KeyCode::Char('S'));
+        assert!(matches!(app.screen, Screen::ChangeList { .. }));
+        assert_eq!(app.config.command, "Xtest-tool {prompt}");
+    }
+
+    #[test]
+    fn test_config_reset_to_defaults() {
+        let mut app = make_config_app();
+        app.push_config_screen();
+
+        // Switch to prompt field
+        app.handle_config_input(KeyCode::Tab);
+
+        // Reset to defaults
+        app.handle_config_input(KeyCode::Char('D'));
+        if let Screen::Config { command, prompt, focused_field, .. } = &app.screen {
+            let defaults = TuiConfig::default();
+            assert_eq!(command, &defaults.command);
+            assert_eq!(prompt, &defaults.prompt);
+            assert_eq!(*focused_field, ConfigField::Command);
+        } else {
+            panic!("Expected Config screen");
+        }
+    }
+
+    #[test]
+    fn test_config_enter_on_prompt_returns_true() {
+        let mut app = make_config_app();
+        app.push_config_screen();
+
+        // Switch to prompt field
+        app.handle_config_input(KeyCode::Tab);
+
+        // Enter on prompt should signal editor
+        let result = app.handle_config_input(KeyCode::Enter);
+        assert!(result, "Enter on prompt field should return true for editor");
+        // Screen should still be Config
+        assert!(matches!(app.screen, Screen::Config { .. }));
+    }
+
+    #[test]
+    fn test_config_enter_on_command_doesnt_signal_editor() {
+        let mut app = make_config_app();
+        app.push_config_screen();
+
+        // On command field, Enter should not signal editor
+        let result = app.handle_config_input(KeyCode::Enter);
+        assert!(!result, "Enter on command field should not signal editor");
+    }
+
+    #[test]
+    fn test_config_s_in_navigation_mode_saves() {
+        let mut app = make_config_app();
+        app.push_config_screen();
+
+        // S in navigation mode saves and exits, even with Command focused
+        app.handle_config_input(KeyCode::Char('S'));
+        assert!(matches!(app.screen, Screen::ChangeList { .. }));
+    }
+
+    #[test]
+    fn test_config_d_in_navigation_mode_resets() {
+        let mut app = make_config_app();
+        app.push_config_screen();
+
+        // D in navigation mode resets to defaults, even with Command focused
+        app.handle_config_input(KeyCode::Char('D'));
+        if let Screen::Config { command, prompt, .. } = &app.screen {
+            let defaults = TuiConfig::default();
+            assert_eq!(command, &defaults.command);
+            assert_eq!(prompt, &defaults.prompt);
+        } else {
+            panic!("Expected Config screen");
+        }
+    }
+
+    #[test]
+    fn test_set_config_prompt() {
+        let mut app = make_config_app();
+        app.push_config_screen();
+
+        app.set_config_prompt("new prompt text".to_string());
+        if let Screen::Config { prompt, .. } = &app.screen {
+            assert_eq!(prompt, "new prompt text");
+        } else {
+            panic!("Expected Config screen");
+        }
+    }
+
+    #[test]
+    fn test_config_char_keys_ignored_in_navigation_mode() {
+        let mut app = make_config_app();
+        app.push_config_screen();
+
+        let original = if let Screen::Config { command, .. } = &app.screen {
+            command.clone()
+        } else {
+            panic!("Expected Config screen");
+        };
+
+        // Character keys should be ignored in navigation mode
+        app.handle_config_input(KeyCode::Char('x'));
+        app.handle_config_input(KeyCode::Char('y'));
+        app.handle_config_input(KeyCode::Char('z'));
+
+        if let Screen::Config { command, editing, .. } = &app.screen {
+            assert_eq!(command, &original, "Command should not change in navigation mode");
+            assert!(!editing, "Should still be in navigation mode");
+        } else {
+            panic!("Expected Config screen");
+        }
+    }
+
+    #[test]
+    fn test_config_enter_activates_edit_mode() {
+        let mut app = make_config_app();
+        app.push_config_screen();
+
+        // Initially not editing
+        if let Screen::Config { editing, .. } = &app.screen {
+            assert!(!editing);
+        }
+
+        // Enter activates edit mode on Command field
+        app.handle_config_input(KeyCode::Enter);
+        if let Screen::Config { editing, .. } = &app.screen {
+            assert!(*editing, "Enter should activate edit mode");
+        } else {
+            panic!("Expected Config screen");
+        }
+    }
+
+    #[test]
+    fn test_config_esc_exits_edit_mode() {
+        let mut app = make_config_app();
+        app.push_config_screen();
+
+        // Enter edit mode
+        app.handle_config_input(KeyCode::Enter);
+        // Type something
+        app.handle_config_input(KeyCode::Char('X'));
+
+        // Esc should exit edit mode (not the config screen)
+        app.handle_config_input(KeyCode::Esc);
+        if let Screen::Config { editing, command, .. } = &app.screen {
+            assert!(!editing, "Esc should return to navigation mode");
+            assert!(command.contains('X'), "Edits should be preserved");
+        } else {
+            panic!("Expected Config screen, not exit");
+        }
+    }
+
+    #[test]
+    fn test_config_enter_exits_edit_mode() {
+        let mut app = make_config_app();
+        app.push_config_screen();
+
+        // Enter edit mode
+        app.handle_config_input(KeyCode::Enter);
+        // Type something
+        app.handle_config_input(KeyCode::Char('Z'));
+
+        // Enter again should exit edit mode
+        app.handle_config_input(KeyCode::Enter);
+        if let Screen::Config { editing, command, .. } = &app.screen {
+            assert!(!editing, "Enter should return to navigation mode");
+            assert!(command.contains('Z'), "Edits should be preserved");
+        } else {
+            panic!("Expected Config screen");
+        }
+    }
+
+    #[test]
+    fn test_config_backspace_at_start_noop() {
+        let mut app = make_config_app();
+        app.push_config_screen();
+
+        // Enter edit mode, move to start
+        app.handle_config_input(KeyCode::Enter);
+        app.handle_config_input(KeyCode::Home);
+        let original = if let Screen::Config { command, .. } = &app.screen {
+            command.clone()
+        } else {
+            String::new()
+        };
+
+        app.handle_config_input(KeyCode::Backspace);
+        if let Screen::Config { command, cursor_position, .. } = &app.screen {
+            assert_eq!(command, &original);
+            assert_eq!(*cursor_position, 0);
+        }
+    }
+
+    #[test]
+    fn test_config_delete_at_end_noop() {
+        let mut app = make_config_app();
+        app.push_config_screen();
+
+        // Enter edit mode (cursor starts at end)
+        app.handle_config_input(KeyCode::Enter);
+        let original = if let Screen::Config { command, .. } = &app.screen {
+            command.clone()
+        } else {
+            String::new()
+        };
+
+        app.handle_config_input(KeyCode::Delete);
+        if let Screen::Config { command, .. } = &app.screen {
+            assert_eq!(command, &original);
+        }
     }
 }

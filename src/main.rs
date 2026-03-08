@@ -1,5 +1,6 @@
-mod data;
 mod app;
+mod config;
+mod data;
 mod runner;
 mod ui;
 
@@ -44,6 +45,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Suspend the TUI, open `$EDITOR` (fallback: `vi`) with a temp file containing `content`,
+/// and return the edited text.
+fn edit_in_external_editor(
+    terminal: &mut ratatui::Terminal<CrosstermBackend<io::Stdout>>,
+    content: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    use std::io::Write as _;
+
+    let mut tmp = tempfile::NamedTempFile::new()?;
+    tmp.write_all(content.as_bytes())?;
+    tmp.flush()?;
+    let path = tmp.path().to_path_buf();
+
+    // Restore terminal for the editor
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+    let status = std::process::Command::new(&editor)
+        .arg(&path)
+        .status();
+
+    // Re-enter TUI mode
+    enable_raw_mode()?;
+    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+    terminal.clear()?;
+
+    status?;
+    let edited = std::fs::read_to_string(&path)?;
+    Ok(edited)
+}
+
 fn run_app(terminal: &mut ratatui::Terminal<CrosstermBackend<io::Stdout>>) -> Result<(), Box<dyn std::error::Error>> {
     let mut app = App::new()?;
 
@@ -55,6 +88,27 @@ fn run_app(terminal: &mut ratatui::Terminal<CrosstermBackend<io::Stdout>>) -> Re
         if event::poll(Duration::from_millis(500))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+
+                // In Config screen, all keys go to the config handler
+                if matches!(app.screen, Screen::Config { .. }) {
+                    let open_editor = app.handle_config_input(key.code);
+                    if open_editor {
+                        // Get current prompt text
+                        let current_prompt = if let Screen::Config { prompt, .. } = &app.screen {
+                            prompt.clone()
+                        } else {
+                            String::new()
+                        };
+                        // Open $EDITOR with temp file
+                        if let Ok(new_prompt) = edit_in_external_editor(terminal, &current_prompt) {
+                            app.set_config_prompt(new_prompt);
+                        }
+                    }
+                    if app.should_quit {
+                        return Ok(());
+                    }
                     continue;
                 }
 
@@ -76,6 +130,9 @@ fn run_app(terminal: &mut ratatui::Terminal<CrosstermBackend<io::Stdout>>) -> Re
                     }
                     Screen::ArtifactView { .. } => {
                         app.handle_artifact_view_input(key.code);
+                    }
+                    Screen::Config { .. } => {
+                        // Handled above
                     }
                 }
 

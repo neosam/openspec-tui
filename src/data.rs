@@ -58,21 +58,6 @@ fn openspec_command() -> Command {
     Command::new("openspec")
 }
 
-/// Construct a `Command` for invoking the `claude` CLI.
-///
-/// Follows the same cross-platform pattern as `openspec_command`.
-#[cfg(windows)]
-pub fn claude_command() -> Command {
-    let mut cmd = Command::new("cmd");
-    cmd.args(["/C", "claude"]);
-    cmd
-}
-
-#[cfg(not(windows))]
-pub fn claude_command() -> Command {
-    Command::new("claude")
-}
-
 /// Run `openspec list --json` and parse the result.
 pub fn list_changes() -> Result<ChangeListOutput, String> {
     let output = openspec_command()
@@ -379,16 +364,6 @@ mod tests {
         let program = format!("{:?}", cmd.get_program());
         #[cfg(not(windows))]
         assert_eq!(program, "\"openspec\"");
-        #[cfg(windows)]
-        assert_eq!(program, "\"cmd\"");
-    }
-
-    #[test]
-    fn test_claude_command_returns_valid_command() {
-        let cmd = claude_command();
-        let program = format!("{:?}", cmd.get_program());
-        #[cfg(not(windows))]
-        assert_eq!(program, "\"claude\"");
         #[cfg(windows)]
         assert_eq!(program, "\"cmd\"");
     }
