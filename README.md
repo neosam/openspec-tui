@@ -150,4 +150,4 @@ Run `openspec-tui` from a directory that contains an `openspec/` folder with cha
 
 ## License
 
-Not yet specified.
+MIT — see [LICENSE](LICENSE).
